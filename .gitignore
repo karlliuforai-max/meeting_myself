@@ -1,0 +1,26 @@
+# 敏感：原始录音/转写稿、会话数据，不入库不外发
+/data/
+backend/data/
+
+# 凭据
+.env
+**/.env
+!**/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node / 前端
+node_modules/
+frontend/dist/
+.vite/
+
+# CodeGraph（本机生成的代码索引，不入库）
+.codegraph/
+
+# 系统
+.DS_Store
