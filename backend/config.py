@@ -20,8 +20,20 @@ class Settings(BaseSettings):
     # 模型凭据
     anthropic_api_key: Optional[str] = None
     deepseek_api_key: Optional[str] = None
-    openai_compat_api_key: Optional[str] = None
-    openai_compat_base_url: Optional[str] = None
+
+    # 第三方 / 自定义 OpenAI 兼容端点（四要素）
+    openai_compat_label: str = "自定义模型"        # Provider 显示名
+    openai_compat_base_url: Optional[str] = None    # url
+    openai_compat_api_key: Optional[str] = None     # apikey
+    openai_compat_model: Optional[str] = None       # model（默认模型）
+    openai_compat_vision: bool = False              # 该模型是否支持视觉（看图）
+
+    # 第三方 Anthropic 兼容中转站（Messages 原生格式，四要素）
+    anthropic_compat_label: str = "Anthropic 中转站"
+    anthropic_compat_base_url: Optional[str] = None
+    anthropic_compat_api_key: Optional[str] = None
+    anthropic_compat_model: Optional[str] = None
+    anthropic_compat_vision: bool = False
 
     # 默认 provider / 模型
     default_provider: str = "claude"

@@ -38,7 +38,8 @@ class _OpenAICompatBase(BaseProvider):
             raise ProviderError("未安装 openai SDK：pip install openai") from e
 
         client = OpenAI(api_key=self._api_key(), base_url=self.base_url)
-        model = model or settings.default_model or self.default_model
+        # 优先用显式传入的模型，否则用本 provider 自己的默认模型
+        model = model or self.default_model
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -73,11 +74,29 @@ class DeepSeekProvider(_OpenAICompatBase):
 
 
 class OpenAICompatProvider(_OpenAICompatBase):
-    """通用兜底：接入任意 OpenAI 兼容端点。"""
+    """通用：接入任意第三方 OpenAI 兼容端点。
+
+    四要素全部来自 .env：
+      OPENAI_COMPAT_LABEL    显示名（Provider）
+      OPENAI_COMPAT_BASE_URL url
+      OPENAI_COMPAT_API_KEY  apikey
+      OPENAI_COMPAT_MODEL    model
+    内部注册 key 固定为 "openai_compat"（前端按它选用）。
+    """
 
     name = "openai_compat"
-    supports_vision = False
-    default_model = "gpt-4o-mini"
+
+    @property
+    def label(self) -> str:
+        return settings.openai_compat_label or "自定义模型"
+
+    @property
+    def supports_vision(self) -> bool:  # type: ignore[override]
+        return settings.openai_compat_vision
+
+    @property
+    def default_model(self) -> str:  # type: ignore[override]
+        return settings.openai_compat_model or ""
 
     @property
     def base_url(self) -> str:  # type: ignore[override]
@@ -85,3 +104,10 @@ class OpenAICompatProvider(_OpenAICompatBase):
 
     def _api_key(self) -> Optional[str]:
         return settings.openai_compat_api_key
+
+    def is_configured(self) -> bool:
+        # 自定义端点需四要素齐全（url + key + model）
+        return bool(self._api_key() and self.base_url and self.default_model)
+
+    def list_models(self):
+        return [self.default_model] if self.default_model else []

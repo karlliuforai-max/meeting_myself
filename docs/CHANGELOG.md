@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.0.2 — 2026-06-14
+
+### 新增
+- 第三方 Anthropic 兼容中转站 Provider（`anthropic_compat`，Messages 原生格式，四要素配置）
+- OpenAI 兼容 Provider 升级为四要素配置（Provider 名 / url / apikey / model + 视觉开关）
+- 工作台支持上传输入素材（txt/pdf/图片）与保存「补充背景 & 重点要求」
+
+### 修复
+- 全局 `DEFAULT_MODEL` 串台 bug：原会把默认模型名发给所有 provider，现各 provider 用自身默认模型
+- 中转站经 Cloudflare 被 403「Your request was blocked」：中转站 Provider 自动伪装浏览器 UA 绕过 WAF
+
+### 优化
+- UI 改为 Anthropic 官网风格（暖米白底 + 珊瑚色点缀 + 衬线标题）
+- 交互结构调整：新建项目仅需名字（默认「新项目」）；背景信息移入工作台；
+  工作台自上而下为 输入素材 → 补充背景 → 确认生成 → 输出区
+
 ## v0.0.1 — 2026-06-14
 
 ### 完成

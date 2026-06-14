@@ -28,8 +28,13 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">📝 会议纪要生成平台</div>
+        <div className="brand">
+          <span className="brand-mark">✳</span>
+          <span className="brand-name">会议纪要</span>
+          <span className="brand-sub">生成平台</span>
+        </div>
         <div className={"status " + (health ? "ok" : "down")}>
+          <span className="status-dot" />
           {health ? `后端在线 · ${health.phase}` : "后端离线"}
         </div>
       </header>

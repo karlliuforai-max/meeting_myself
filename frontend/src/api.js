@@ -27,5 +27,17 @@ export const api = {
   createSession: (body) =>
     req("/sessions", { method: "POST", body: JSON.stringify(body) }),
   getSession: (id) => req(`/sessions/${id}`),
+  updateSession: (id, body) =>
+    req(`/sessions/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteSession: (id) => req(`/sessions/${id}`, { method: "DELETE" }),
+  uploadInputs: async (id, fileList) => {
+    const form = new FormData();
+    for (const f of fileList) form.append("files", f);
+    const res = await fetch(`/api/sessions/${id}/inputs`, {
+      method: "POST",
+      body: form, // 不手动设 Content-Type，浏览器自动带 boundary
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    return res.json();
+  },
 };

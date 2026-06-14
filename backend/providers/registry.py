@@ -6,11 +6,12 @@ from typing import Dict, List, Optional
 from config import settings
 
 from .base import BaseProvider, ProviderError
-from .claude import ClaudeProvider
+from .claude import AnthropicCompatProvider, ClaudeProvider
 from .openai_compat import DeepSeekProvider, OpenAICompatProvider
 
 _PROVIDERS: Dict[str, BaseProvider] = {
     "claude": ClaudeProvider(),
+    "anthropic_compat": AnthropicCompatProvider(),
     "deepseek": DeepSeekProvider(),
     "openai_compat": OpenAICompatProvider(),
 }
@@ -30,6 +31,7 @@ def list_providers() -> List[dict]:
         out.append(
             {
                 "name": name,
+                "label": getattr(p, "label", name),
                 "configured": p.is_configured(),
                 "supports_vision": p.supports_vision,
                 "default_model": p.default_model,

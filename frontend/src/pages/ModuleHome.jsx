@@ -1,11 +1,11 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api";
 
-// 板块首页：会话列表 + 新建会话（含任务前自定义提示词）。
+// 板块首页：会话列表 + 极简新建（只需一个名字，默认"新项目"）。
+// 补充背景/重点要求移到工作台内填写。
 export default function ModuleHome({ module, onOpenSession }) {
   const [sessions, setSessions] = useState([]);
-  const [title, setTitle] = useState("");
-  const [prePrompt, setPrePrompt] = useState("");
+  const [title, setTitle] = useState("新项目");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -17,17 +17,12 @@ export default function ModuleHome({ module, onOpenSession }) {
   }, [module.key]);
 
   async function create() {
-    if (!title.trim()) return setErr("请填写会议/课程标题");
+    const name = title.trim() || "新项目";
     setBusy(true);
     setErr("");
     try {
-      const s = await api.createSession({
-        module: module.key,
-        title: title.trim(),
-        pre_prompt: prePrompt.trim(),
-      });
-      setTitle("");
-      setPrePrompt("");
+      const s = await api.createSession({ module: module.key, title: name });
+      setTitle("新项目");
       await refresh();
       onOpenSession(s.id);
     } catch (e) {
@@ -38,7 +33,7 @@ export default function ModuleHome({ module, onOpenSession }) {
   }
 
   async function remove(id) {
-    if (!confirm("确认删除该会话？数据将不可恢复。")) return;
+    if (!confirm("确认删除该项目？数据将不可恢复。")) return;
     await api.deleteSession(id);
     refresh();
   }
@@ -49,34 +44,28 @@ export default function ModuleHome({ module, onOpenSession }) {
       <p className="muted">{module.description}</p>
 
       <section className="card">
-        <h2>新建会话</h2>
-        <label>
-          会议 / 课程标题
+        <h2>新建项目</h2>
+        <div className="create-row">
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="如：光华《公司金融》第3讲 估值"
+            onKeyDown={(e) => e.key === "Enter" && create()}
+            placeholder="新项目"
           />
-        </label>
-        <label>
-          任务前·补充背景 &amp; 重点要求（可选，将注入全流程）
-          <textarea
-            rows={4}
-            value={prePrompt}
-            onChange={(e) => setPrePrompt(e.target.value)}
-            placeholder="如：老师叫 张三；公司案例是宁德时代；重点体现 DCF 与可比公司法的对比；术语 WACC 必须保留英文。"
-          />
-        </label>
+          <button className="primary" onClick={create} disabled={busy}>
+            {busy ? "创建中…" : "创建并进入"}
+          </button>
+        </div>
         {err && <div className="banner error">{err}</div>}
-        <button className="primary" onClick={create} disabled={busy}>
-          {busy ? "创建中…" : "创建并进入工作台"}
-        </button>
+        <p className="muted small" style={{ marginTop: 10 }}>
+          只需起个名字即可创建；素材与背景要求进入工作台后再填。
+        </p>
       </section>
 
       <section className="card">
-        <h2>历史会话（{sessions.length}）</h2>
+        <h2>历史项目（{sessions.length}）</h2>
         {sessions.length === 0 ? (
-          <p className="muted">暂无会话。</p>
+          <p className="muted">暂无项目。</p>
         ) : (
           <ul className="session-list">
             {sessions.map((s) => (
@@ -88,6 +77,7 @@ export default function ModuleHome({ module, onOpenSession }) {
                   {" "}
                   · {s.status} · {s.artifacts.length} 个产出
                 </span>
+                <span style={{ flex: 1 }} />
                 <button className="danger small" onClick={() => remove(s.id)}>
                   删除
                 </button>
