@@ -1,13 +1,12 @@
-"""OpenAI 兼容 Provider 基类 + 通用兜底实现。
+"""OpenAI 兼容调用基类 —— Chat Completions 接口。
 
-DeepSeek 等众多服务都兼容 OpenAI Chat Completions 接口，这里抽一层共用。
-通用兜底（OpenAICompatProvider）允许用户填任意 base_url + key 接入自定义端点。
+DeepSeek 等众多服务都兼容 OpenAI Chat Completions，这里抽一层共用。
+具体 Provider 由 dynamic.py 按配置（store）动态构建；本文件只保留共享的
+chat 调用逻辑（_OpenAICompatBase）。子类提供 _api_key() 与 base_url。
 """
 from __future__ import annotations
 
 from typing import List, Optional
-
-from config import settings
 
 from .base import BaseProvider, ChatResult, Message, ProviderError
 
@@ -58,59 +57,3 @@ class _OpenAICompatBase(BaseProvider):
                 "output_tokens": resp.usage.completion_tokens,
             }
         return ChatResult(text=text, model=model, provider=self.name, usage=usage)
-
-
-class DeepSeekProvider(_OpenAICompatBase):
-    """DeepSeek 官方 API。模型名 v4-pro / v4-flash（2026/07/24 后旧别名 deepseek-chat 等下线）。"""
-
-    name = "deepseek"
-    label = "DeepSeek"  # 前端显示用
-    supports_vision = False
-    default_model = "deepseek-v4-flash"
-    base_url = "https://api.deepseek.com"
-
-    def _api_key(self) -> Optional[str]:
-        return settings.deepseek_api_key
-
-    def list_models(self) -> List[str]:
-        return ["deepseek-v4-flash", "deepseek-v4-pro"]
-
-
-class OpenAICompatProvider(_OpenAICompatBase):
-    """通用：接入任意第三方 OpenAI 兼容端点。
-
-    四要素全部来自 .env：
-      OPENAI_COMPAT_LABEL    显示名（Provider）
-      OPENAI_COMPAT_BASE_URL url
-      OPENAI_COMPAT_API_KEY  apikey
-      OPENAI_COMPAT_MODEL    model
-    内部注册 key 固定为 "openai_compat"（前端按它选用）。
-    """
-
-    name = "openai_compat"
-
-    @property
-    def label(self) -> str:
-        return settings.openai_compat_label or "自定义模型"
-
-    @property
-    def supports_vision(self) -> bool:  # type: ignore[override]
-        return settings.openai_compat_vision
-
-    @property
-    def default_model(self) -> str:  # type: ignore[override]
-        return settings.openai_compat_model or ""
-
-    @property
-    def base_url(self) -> str:  # type: ignore[override]
-        return settings.openai_compat_base_url or ""
-
-    def _api_key(self) -> Optional[str]:
-        return settings.openai_compat_api_key
-
-    def is_configured(self) -> bool:
-        # 自定义端点需四要素齐全（url + key + model）
-        return bool(self._api_key() and self.base_url and self.default_model)
-
-    def list_models(self):
-        return [self.default_model] if self.default_model else []

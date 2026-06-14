@@ -216,6 +216,13 @@ textarea:focus {
   border-color: var(--clay);
   box-shadow: 0 0 0 3px var(--clay-soft);
 }
+/* 复选框/单选框不吃上面的全宽规则 */
+input[type="checkbox"],
+input[type="radio"] {
+  width: auto;
+  margin-top: 0;
+  padding: 0;
+}
 textarea {
   resize: vertical;
   line-height: 1.6;
@@ -787,4 +794,321 @@ input[type="file"] {
   background: none;
   padding: 0;
   margin-top: 6px;
+}
+
+/* 原地重命名输入框（替代弹框） */
+.inline-edit {
+  font: inherit;
+  color: var(--ink);
+  background: var(--ivory-card);
+  border: 1px solid var(--clay);
+  border-radius: 6px;
+  padding: 4px 8px;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--clay-soft);
+}
+.inline-edit.title-edit {
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 600;
+  padding: 2px 10px;
+}
+.inline-edit.file-name-edit {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+}
+
+/* ---------- 顶栏右侧 + 模型配置按钮 ---------- */
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.config-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--ivory-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 7px 14px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.config-btn:hover {
+  border-color: var(--clay);
+  background: var(--clay-soft);
+}
+.config-ico {
+  font-size: 15px;
+}
+
+/* ---------- 通用成功提示 ---------- */
+.banner.ok {
+  background: #e6efe2;
+  color: #3f6b34;
+  padding: 10px 14px;
+  border-radius: 9px;
+  font-size: 13px;
+  margin: 12px 0;
+  border: 1px solid #cadcc0;
+}
+
+/* ---------- 弹窗（模型配置）---------- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(26, 25, 21, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 24px;
+}
+.modal {
+  background: var(--ivory);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.25);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal.mc {
+  width: min(880px, 96vw);
+}
+.mc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--border);
+}
+.mc-head h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 20px;
+}
+.mc-close {
+  background: none;
+  border: none;
+  font-size: 17px;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.mc-close:hover {
+  background: var(--ivory-hover);
+  color: var(--ink);
+}
+.mc-body {
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 左列：供应商列表 */
+.mc-list {
+  width: 232px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mc-item {
+  text-align: left;
+  background: var(--ivory-card);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 10px 12px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mc-item:hover {
+  border-color: var(--border-strong);
+}
+.mc-item.active {
+  border-color: var(--clay);
+  background: var(--clay-soft);
+}
+.mc-item-name {
+  font-size: 14px;
+  color: var(--ink);
+}
+.mc-item-meta {
+  display: flex;
+  gap: 6px;
+}
+.mc-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 20px;
+  border: 1px solid transparent;
+}
+.mc-badge.def {
+  background: var(--clay);
+  color: #fff;
+}
+.mc-badge.ok {
+  background: #e6efe2;
+  color: #3f6b34;
+}
+.mc-badge.off {
+  background: var(--ivory-hover);
+  color: var(--muted);
+}
+.mc-add {
+  margin-top: 4px;
+  background: none;
+  border: 1px dashed var(--clay);
+  color: var(--clay-deep);
+  border-radius: 9px;
+  padding: 9px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.mc-add:hover {
+  background: var(--clay-soft);
+}
+
+/* 右侧：表单 */
+.mc-form {
+  flex: 1;
+  min-width: 0;
+  padding: 18px 22px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mc-form-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.mc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.mc-field > span {
+  font-size: 13px;
+  color: var(--ink-soft);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.mc-field input,
+.mc-field select,
+.mc-field textarea {
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--ink);
+  background: var(--ivory-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 9px 11px;
+  outline: none;
+  margin-top: 0;
+  width: 100%;
+}
+.mc-field textarea {
+  resize: vertical;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.mc-field input:focus,
+.mc-field select:focus,
+.mc-field textarea:focus {
+  border-color: var(--clay);
+  box-shadow: 0 0 0 3px var(--clay-soft);
+}
+.mc-check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+  background: var(--ivory-card);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 11px 13px;
+}
+.mc-check input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--clay);
+  cursor: pointer;
+}
+.mc-check span {
+  white-space: nowrap;
+}
+
+/* API Key 明文/掩码切换 */
+.mc-key-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.mc-key-wrap {
+  margin-top: 0;
+}
+.mc-key-wrap input {
+  margin-top: 0;
+  padding-right: 42px;
+}
+.mc-key-eye {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.mc-key-eye:hover {
+  color: var(--clay);
+  background: var(--clay-soft);
+}
+.mc-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.mc-actions button:not(.primary):not(.danger) {
+  background: var(--ivory-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 9px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.mc-actions button:not(.primary):not(.danger):hover {
+  border-color: var(--clay);
 }

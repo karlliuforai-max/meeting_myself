@@ -20,6 +20,14 @@ export const api = {
   health: () => req("/health"),
   modules: () => req("/modules"),
   providers: () => req("/providers"),
+  getProvider: (pid) => req(`/providers/${pid}`),
+  addProvider: (body) =>
+    req("/providers", { method: "POST", body: JSON.stringify(body) }),
+  updateProvider: (pid, body) =>
+    req(`/providers/${pid}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteProvider: (pid) => req(`/providers/${pid}`, { method: "DELETE" }),
+  setDefaultProvider: (pid) =>
+    req(`/providers/${pid}/default`, { method: "PUT" }),
   testProvider: (body) =>
     req("/providers/test", { method: "POST", body: JSON.stringify(body) }),
   listSessions: (module) =>

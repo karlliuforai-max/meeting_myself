@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.3.0 — 2026-06-15
+
+### 模型配置中心：Provider 从 .env 静态配置 → 运行时可视化管理
+
+#### 新功能
+- **模型配置面板**（右上角 ⚙）：随时新增 / 编辑 / 删除供应商，配置接口协议、Base URL、API Key、模型列表、默认模型、视觉开关，并一键设默认、连通测试（支持测试未保存的草稿）。
+- **Provider 持久化存储**（`providers/store.py`）：配置落盘到 `data/providers.json`（git 忽略，含密钥不外发）。首次运行从既有 `.env` 播种四个供应商，沿用 `claude/anthropic_compat/deepseek/openai_compat` 作为稳定 id，历史会话的 step_models 引用不受影响。
+- **动态 Provider 构建**（`providers/dynamic.py`）：按配置实时构建 Provider，复用既有 Anthropic Messages / OpenAI Chat Completions 两套调用逻辑。
+- **项目重命名**：项目列表与工作台标题均可重命名；上传素材改名改为**原地编辑**（新增通用 `InlineEdit` 组件，回车/失焦保存、Esc 取消、双击进入），替代原 `prompt()` 弹框。
+
+#### API
+- `GET /api/providers`（含 `default_id`，列表不外泄 api_key）
+- `GET /api/providers/{id}`（单条完整配置，供编辑回填）
+- `POST /api/providers` 新增 · `PUT /api/providers/{id}` 编辑 · `DELETE /api/providers/{id}` 删除
+- `PUT /api/providers/{id}/default` 设默认
+- `POST /api/providers/test` 扩展为支持测试未保存的草稿配置（`config` 字段）
+
+#### 健壮性修复
+- **会话元数据并发安全**：`SessionStore` 加锁 + `_write_meta` 原子写（临时文件 + rename）+ 新增 `mutate()` 锁内读改写；改名、step-model 路由改走 `mutate`，杜绝多产出并行结束时互相覆盖 `meta.json`。
+- **Runner 内存回收**：`(sid, step)` 任务完成即从内存表移除（历史已落盘，迟到订阅自动回退读盘），不再无限累积。
+
+#### 清理与一致性
+- 删除四个不再使用的具体 Provider 类（registry 重写后只复用 `_AnthropicBase` / `_OpenAICompatBase` 两个调用基类）。
+- 移除 `StepDef` 中失效的 `default_provider/default_model` 字段（默认模型由配置面板的 store 默认项决定）。
+- 生成失败文案由「检查 .env」改为「在右上角模型配置面板补全」。
+- 删除误入的 `backend/package-lock.json` 与空目录 `backend/revision/`（版本管理实际在 `storage/`）。
+- README / `.env.example` 说明 `.env` 仅用于首次播种，日常配置走面板。
+
+#### UI 细节
+- 模型配置面板：接口协议命名专业化（OpenAI Chat Completions / Anthropic Messages）；API Key 加眼睛图标明文/掩码切换；默认模型改为真正可点选的下拉；修复「支持视觉」复选框被全局 `input{width:100%}` 撑坏导致的换行排版问题。
+
 ## v0.2.0 — 2026-06-14
 
 ### 重大改版：五产出独立生成 + 横版 Tab + 矢量脉络图

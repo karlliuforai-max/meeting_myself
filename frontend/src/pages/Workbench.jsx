@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import OutputView from "../components/OutputView.jsx";
+import InlineEdit from "../components/InlineEdit.jsx";
 
 /**
  * 会话工作台。结构：
@@ -11,7 +12,7 @@ import OutputView from "../components/OutputView.jsx";
  * 每个产出独立选模型、独立生成、独立看内容。
  * 依赖未满足时 Tab 会变灰提示，按钮也会禁用。
  */
-export default function Workbench({ module, sessionId, onBack }) {
+export default function Workbench({ module, sessionId, onBack, providersVersion = 0 }) {
   const [session, setSession] = useState(null);
   const [providers, setProviders] = useState([]);
   const [prePrompt, setPrePrompt] = useState("");
@@ -21,6 +22,8 @@ export default function Workbench({ module, sessionId, onBack }) {
 
   const [artifacts, setArtifacts] = useState({}); // step.key → content
   const [stepStatus, setStepStatus] = useState({}); // step.key → {running, percent, message, err}
+  const [editingTitle, setEditingTitle] = useState(false); // 是否在改项目名
+  const [editingFile, setEditingFile] = useState(null); // 正在改名的文件原名（null=无）
 
   const fileRef = useRef(null);
   const esRefs = useRef({});
@@ -71,6 +74,12 @@ export default function Workbench({ module, sessionId, onBack }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
+  // 模型配置面板改动后，重新拉取 provider 列表（不打断进行中的生成）
+  useEffect(() => {
+    if (providersVersion > 0) api.providers().then((d) => setProviders(d.providers));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providersVersion]);
+
   async function savePrePrompt() {
     await api.updateSession(sessionId, { pre_prompt: prePrompt });
     setSavedHint("已保存");
@@ -100,16 +109,28 @@ export default function Workbench({ module, sessionId, onBack }) {
     }
   }
 
-  async function onRenameFile(name) {
+  // 提交文件改名：value 是不含扩展名的新主名（扩展名自动保留）
+  async function commitRenameFile(name, value) {
     const dot = name.lastIndexOf(".");
     const stem = dot > 0 ? name.slice(0, dot) : name;
     const ext = dot > 0 ? name.slice(dot) : "";
-    const next = prompt("重命名（保留扩展名 " + (ext || "无") + "）", stem);
-    if (next == null) return;
-    const trimmed = next.trim();
+    const trimmed = value.trim();
+    setEditingFile(null);
     if (!trimmed || trimmed === stem) return;
     try {
       await api.renameInput(sessionId, name, trimmed + ext);
+      load();
+    } catch (e) {
+      alert("重命名失败：" + e.message);
+    }
+  }
+
+  async function commitRenameSession(value) {
+    const name = value.trim();
+    setEditingTitle(false);
+    if (!name || name === session.title) return;
+    try {
+      await api.updateSession(sessionId, { title: name });
       load();
     } catch (e) {
       alert("重命名失败：" + e.message);
@@ -210,7 +231,21 @@ export default function Workbench({ module, sessionId, onBack }) {
     <div className="workbench">
       <div className="wb-head">
         <button className="link" onClick={onBack}>← 返回</button>
-        <h1>{session.title}</h1>
+        {editingTitle ? (
+          <InlineEdit
+            initial={session.title}
+            className="title-edit"
+            onCommit={commitRenameSession}
+            onCancel={() => setEditingTitle(false)}
+          />
+        ) : (
+          <h1 onDoubleClick={() => setEditingTitle(true)} title="双击可重命名">
+            {session.title}
+          </h1>
+        )}
+        {!editingTitle && (
+          <button className="link small" onClick={() => setEditingTitle(true)} title="重命名项目">重命名</button>
+        )}
         <span className="muted small">状态：{session.status}</span>
       </div>
 
@@ -240,11 +275,28 @@ export default function Workbench({ module, sessionId, onBack }) {
           {hasInputs ? (
             session.inputs.map((f) => (
               <div className="file-row" key={f}>
-                <span className="file-name" title={f}>{f}</span>
-                <div className="file-actions">
-                  <button className="file-act" onClick={() => onRenameFile(f)} title="重命名">改名</button>
-                  <button className="file-act danger" onClick={() => onDeleteFile(f)} title="删除">删除</button>
-                </div>
+                {editingFile === f ? (
+                  <InlineEdit
+                    initial={f.lastIndexOf(".") > 0 ? f.slice(0, f.lastIndexOf(".")) : f}
+                    className="file-name-edit"
+                    onCommit={(v) => commitRenameFile(f, v)}
+                    onCancel={() => setEditingFile(null)}
+                  />
+                ) : (
+                  <span
+                    className="file-name"
+                    title={f + "（双击可重命名）"}
+                    onDoubleClick={() => setEditingFile(f)}
+                  >
+                    {f}
+                  </span>
+                )}
+                {editingFile !== f && (
+                  <div className="file-actions">
+                    <button className="file-act" onClick={() => setEditingFile(f)} title="重命名">改名</button>
+                    <button className="file-act danger" onClick={() => onDeleteFile(f)} title="删除">删除</button>
+                  </div>
+                )}
               </div>
             ))
           ) : (

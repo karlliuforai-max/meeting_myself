@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api";
+import InlineEdit from "../components/InlineEdit.jsx";
 
 // 板块首页：会话列表 + 极简新建（只需一个名字，默认"新项目"）。
 // 补充背景/重点要求移到工作台内填写。
@@ -8,6 +9,7 @@ export default function ModuleHome({ module, onOpenSession }) {
   const [title, setTitle] = useState("新项目");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [editingId, setEditingId] = useState(null); // 正在改名的项目 id（null=无）
 
   const refresh = () =>
     api.listSessions(module.key).then((d) => setSessions(d.sessions)).catch(() => {});
@@ -29,6 +31,18 @@ export default function ModuleHome({ module, onOpenSession }) {
       setErr(e.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function commitRename(s, value) {
+    const name = value.trim();
+    setEditingId(null);
+    if (!name || name === s.title) return;
+    try {
+      await api.updateSession(s.id, { title: name });
+      refresh();
+    } catch (e) {
+      alert("重命名失败：" + e.message);
     }
   }
 
@@ -70,17 +84,39 @@ export default function ModuleHome({ module, onOpenSession }) {
           <ul className="session-list">
             {sessions.map((s) => (
               <li key={s.id}>
-                <button className="link" onClick={() => onOpenSession(s.id)}>
-                  {s.title}
-                </button>
-                <span className="muted small">
-                  {" "}
-                  · {s.status} · {s.artifacts.length} 个产出
-                </span>
+                {editingId === s.id ? (
+                  <InlineEdit
+                    initial={s.title}
+                    onCommit={(v) => commitRename(s, v)}
+                    onCancel={() => setEditingId(null)}
+                  />
+                ) : (
+                  <button
+                    className="link"
+                    onClick={() => onOpenSession(s.id)}
+                    onDoubleClick={() => setEditingId(s.id)}
+                    title="双击可重命名"
+                  >
+                    {s.title}
+                  </button>
+                )}
+                {editingId !== s.id && (
+                  <span className="muted small">
+                    {" "}
+                    · {s.status} · {s.artifacts.length} 个产出
+                  </span>
+                )}
                 <span style={{ flex: 1 }} />
-                <button className="danger small" onClick={() => remove(s.id)}>
-                  删除
-                </button>
+                {editingId !== s.id && (
+                  <>
+                    <button className="link small" onClick={() => setEditingId(s.id)}>
+                      重命名
+                    </button>
+                    <button className="danger small" onClick={() => remove(s.id)}>
+                      删除
+                    </button>
+                  </>
+                )}
               </li>
             ))}
           </ul>

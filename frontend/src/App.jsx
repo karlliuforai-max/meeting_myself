@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "./api";
 import ModuleSidebar from "./components/ModuleSidebar.jsx";
+import ModelConfig from "./components/ModelConfig.jsx";
 import ModuleHome from "./pages/ModuleHome.jsx";
 import Workbench from "./pages/Workbench.jsx";
 
@@ -10,6 +11,8 @@ export default function App() {
   const [activeModule, setActiveModule] = useState(null);
   const [activeSession, setActiveSession] = useState(null);
   const [error, setError] = useState("");
+  const [showConfig, setShowConfig] = useState(false);
+  const [providersVersion, setProvidersVersion] = useState(0); // 配置变更后自增，触发工作台重载 provider
 
   useEffect(() => {
     api.health().then(setHealth).catch((e) => setError("后端未连接：" + e.message));
@@ -33,11 +36,24 @@ export default function App() {
           <span className="brand-name">会议纪要</span>
           <span className="brand-sub">生成平台</span>
         </div>
-        <div className={"status " + (health ? "ok" : "down")}>
-          <span className="status-dot" />
-          {health ? `后端在线 · ${health.phase}` : "后端离线"}
+        <div className="topbar-right">
+          <div className={"status " + (health ? "ok" : "down")}>
+            <span className="status-dot" />
+            {health ? `后端在线 · ${health.phase}` : "后端离线"}
+          </div>
+          <button className="config-btn" onClick={() => setShowConfig(true)} title="模型配置">
+            <span className="config-ico">⚙</span>
+            <span>模型配置</span>
+          </button>
         </div>
       </header>
+
+      {showConfig && (
+        <ModelConfig
+          onClose={() => setShowConfig(false)}
+          onChanged={() => setProvidersVersion((v) => v + 1)}
+        />
+      )}
 
       {error && <div className="banner error">{error}</div>}
 
@@ -58,6 +74,7 @@ export default function App() {
               module={current}
               sessionId={activeSession}
               onBack={() => setActiveSession(null)}
+              providersVersion={providersVersion}
             />
           ) : (
             <ModuleHome module={current} onOpenSession={setActiveSession} />

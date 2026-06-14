@@ -14,7 +14,8 @@ from pydantic import BaseModel
 
 from modules import get_module, list_modules
 from pipeline import available_artifacts, run_stream, runner
-from providers import Message, ProviderError, get_provider, list_providers
+from providers import Message, ProviderError, build_provider, get_provider, list_providers
+from providers import store as provider_store
 from storage import session_store
 
 router = APIRouter(prefix="/api")
@@ -35,22 +36,86 @@ def modules() -> dict:
 # ---------- 模型 / Provider ----------
 @router.get("/providers")
 def providers() -> dict:
-    return {"providers": list_providers()}
+    return {"providers": list_providers(), "default_id": provider_store.default_id()}
+
+
+@router.get("/providers/{pid}")
+def get_provider_detail(pid: str) -> dict:
+    """取单个 provider 完整配置（含 api_key，供编辑表单回填）。"""
+    cfg = provider_store.get_config(pid)
+    if not cfg:
+        raise HTTPException(404, "provider 配置不存在")
+    return cfg
+
+
+class ProviderConfigReq(BaseModel):
+    label: str
+    kind: str = "openai"  # openai | anthropic
+    base_url: str = ""
+    api_key: str = ""
+    models: List[str] = []
+    default_model: str = ""
+    supports_vision: bool = False
+
+
+@router.post("/providers")
+def add_provider(req: ProviderConfigReq) -> dict:
+    return provider_store.add(req.model_dump())
+
+
+class ProviderPatchReq(BaseModel):
+    label: Optional[str] = None
+    kind: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    models: Optional[List[str]] = None
+    default_model: Optional[str] = None
+    supports_vision: Optional[bool] = None
+
+
+@router.put("/providers/{pid}")
+def edit_provider(pid: str, req: ProviderPatchReq) -> dict:
+    cfg = provider_store.update(pid, req.model_dump(exclude_unset=True))
+    if not cfg:
+        raise HTTPException(404, "provider 配置不存在")
+    return cfg
+
+
+@router.delete("/providers/{pid}")
+def remove_provider(pid: str) -> dict:
+    if not provider_store.delete(pid):
+        raise HTTPException(404, "provider 配置不存在")
+    return {"deleted": pid, "default_id": provider_store.default_id()}
+
+
+@router.put("/providers/{pid}/default")
+def make_default_provider(pid: str) -> dict:
+    if not provider_store.set_default(pid):
+        raise HTTPException(404, "provider 配置不存在")
+    return {"default_id": pid}
 
 
 class ProviderTestReq(BaseModel):
-    provider: Optional[str] = None
+    provider: Optional[str] = None        # 已存配置：按 id 测试
+    config: Optional[ProviderConfigReq] = None  # 未存草稿：直接测试
     model: Optional[str] = None
     prompt: str = "用一句话确认你已就绪。"
 
 
 @router.post("/providers/test")
 def provider_test(req: ProviderTestReq) -> dict:
-    """连通性测试：用最小调用验证某模型是否可用（前端"切换模型"时用）。"""
+    """连通性测试：用最小调用验证某模型是否可用。
+    支持测试已保存的配置（provider=id），也支持测试未保存的草稿（config）。
+    """
     try:
-        p = get_provider(req.provider)
+        if req.config is not None:
+            draft = req.config.model_dump()
+            draft["id"] = "__draft__"
+            p = build_provider(draft)
+        else:
+            p = get_provider(req.provider)
         if not p.is_configured():
-            return {"ok": False, "error": f"{p.name} 未配置 API key。"}
+            return {"ok": False, "error": f"{p.label} 未配置完整（缺 API key / url / 模型）。"}
         res = p.chat([Message("user", req.prompt)], model=req.model, max_tokens=64)
         return {"ok": True, "provider": res.provider, "model": res.model, "text": res.text}
     except ProviderError as e:
@@ -97,14 +162,15 @@ class UpdateSessionReq(BaseModel):
 
 @router.patch("/sessions/{sid}")
 def update_session(sid: str, req: UpdateSessionReq) -> dict:
-    meta = session_store.get(sid)
+    def apply(meta):
+        if req.title is not None:
+            meta.title = req.title
+        if req.pre_prompt is not None:
+            meta.pre_prompt = req.pre_prompt
+
+    meta = session_store.mutate(sid, apply)
     if not meta:
         raise HTTPException(404, "会话不存在")
-    if req.title is not None:
-        meta.title = req.title
-    if req.pre_prompt is not None:
-        meta.pre_prompt = req.pre_prompt
-    session_store.update(meta)
     return _session_public(meta)
 
 
@@ -205,16 +271,17 @@ class StepModelReq(BaseModel):
 @router.put("/sessions/{sid}/step-model")
 def set_step_model(sid: str, req: StepModelReq) -> dict:
     """设置某步骤使用的模型。provider/model 留空 = 重置为默认。"""
-    meta = session_store.get(sid)
+    def apply(meta):
+        sm = dict(meta.step_models or {})
+        if not req.provider and not req.model:
+            sm.pop(req.step, None)
+        else:
+            sm[req.step] = {"provider": req.provider, "model": req.model}
+        meta.step_models = sm
+
+    meta = session_store.mutate(sid, apply)
     if not meta:
         raise HTTPException(404, "会话不存在")
-    sm = dict(meta.step_models or {})
-    if not req.provider and not req.model:
-        sm.pop(req.step, None)
-    else:
-        sm[req.step] = {"provider": req.provider, "model": req.model}
-    meta.step_models = sm
-    session_store.update(meta)
     return {"step_models": meta.step_models}
 
 

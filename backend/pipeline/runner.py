@@ -116,6 +116,11 @@ def start_step(sid: str, step: str) -> bool:
                       "message": f"运行器异常：{e}", "t": time.time()})
         finally:
             run.finish()
+            # 完成即从内存表移除，避免长跑累积；历史已落盘，
+            # 之后的订阅会回退到 load_history（见 subscribe）。
+            with _LOCK:
+                if _RUNS.get(key) is run:
+                    del _RUNS[key]
 
     threading.Thread(target=worker, name=f"gen-{sid}-{step}", daemon=True).start()
     return True

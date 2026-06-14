@@ -13,9 +13,9 @@ class StepDef:
     key: str                 # 步骤标识，如 "transcript"
     title: str               # 展示名，如 "纠错整理逐字稿"
     output_name: str         # 产出文件名，如 "逐字稿.md"
-    default_provider: str = "claude"
-    default_model: str = ""  # 空 = 用 provider 默认
     needs_vision: bool = False
+    # 默认 provider/model 由模型配置面板（store 默认项）决定，不在此写死；
+    # 用户可在每个产出处独立切换（见会话 step_models）。
     # 依赖的前置步骤 key 列表；执行前会检查这些步骤的产出是否都已存在。
     requires: List[str] = field(default_factory=list)
     # OR 依赖：列表中任一存在即可（用于"图谱依赖精炼版或详尽版"）
@@ -47,8 +47,6 @@ class ModuleDef:
                     "requires": s.requires,
                     "requires_any": s.requires_any,
                     "description": s.description,
-                    "default_provider": s.default_provider,
-                    "default_model": s.default_model,
                 }
                 for s in self.steps
             ],

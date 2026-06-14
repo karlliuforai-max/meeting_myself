@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from config import settings
 
@@ -45,6 +47,8 @@ class SessionStore:
     def __init__(self, root: Optional[Path] = None):
         self.root = (root or settings.data_path) / "sessions"
         self.root.mkdir(parents=True, exist_ok=True)
+        # 守护 meta.json 的「读-改-写」复合操作，避免多个产出并行结束时互相覆盖
+        self._lock = threading.RLock()
 
     # ---- 路径助手 ----
     def _dir(self, sid: str) -> Path:
@@ -69,9 +73,24 @@ class SessionStore:
 
     def _write_meta(self, meta: SessionMeta) -> None:
         meta.updated_at = _now()
-        self._meta_path(meta.id).write_text(
+        # 原子写：先写临时文件再 rename，避免写到一半被读到损坏 JSON
+        path = self._meta_path(meta.id)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(asdict(meta), ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        os.replace(tmp, path)
+
+    def mutate(self, sid: str, fn: Callable[[SessionMeta], None]) -> Optional[SessionMeta]:
+        """在锁内对 meta 做「读-改-写」，fn 原地修改 meta。返回更新后的 meta（不存在则 None）。
+        所有会修改 meta 的复合操作都应走这里，避免并发丢更新。"""
+        with self._lock:
+            meta = self.get(sid)
+            if not meta:
+                return None
+            fn(meta)
+            self._write_meta(meta)
+            return meta
 
     def get(self, sid: str) -> Optional[SessionMeta]:
         p = self._meta_path(sid)
@@ -160,21 +179,22 @@ class SessionStore:
 
     def write_artifact(self, sid: str, name: str, content: str, note: str = "") -> int:
         """写入产出当前版本，并归档为新版本。返回新版本号（从 1 起）。"""
-        d = self._dir(sid)
-        (d / "artifacts" / name).write_text(content, encoding="utf-8")
+        with self._lock:
+            d = self._dir(sid)
+            (d / "artifacts" / name).write_text(content, encoding="utf-8")
 
-        vdir = d / "versions" / name
-        vdir.mkdir(parents=True, exist_ok=True)
-        version = len(list(vdir.glob("v*.md"))) + 1
-        (vdir / f"v{version}.md").write_text(content, encoding="utf-8")
-        if note:
-            (vdir / f"v{version}.note.txt").write_text(note, encoding="utf-8")
+            vdir = d / "versions" / name
+            vdir.mkdir(parents=True, exist_ok=True)
+            version = len(list(vdir.glob("v*.md"))) + 1
+            (vdir / f"v{version}.md").write_text(content, encoding="utf-8")
+            if note:
+                (vdir / f"v{version}.note.txt").write_text(note, encoding="utf-8")
 
-        meta = self.get(sid)
-        if meta and name not in meta.artifacts:
-            meta.artifacts.append(name)
-            self._write_meta(meta)
-        return version
+            meta = self.get(sid)
+            if meta and name not in meta.artifacts:
+                meta.artifacts.append(name)
+                self._write_meta(meta)
+            return version
 
     def list_versions(self, sid: str, name: str) -> List[dict]:
         vdir = self._dir(sid) / "versions" / name

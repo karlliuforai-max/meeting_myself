@@ -55,7 +55,7 @@ def _evt(type_: str, **kw) -> dict:
 def _resolve_provider(meta, step_key: str):
     """优先用会话级覆盖（step_models[step_key]），否则用全局默认。"""
     override = (meta.step_models or {}).get(step_key, {}) or {}
-    name = override.get("provider") or settings.default_provider
+    name = override.get("provider") or None  # None → store 默认 provider
     provider = get_provider(name)
     return provider, override.get("model")
 
@@ -157,7 +157,7 @@ def run_one_step(session_id: str, step_key: str) -> Iterator[dict]:
     try:
         probe, _ = _resolve_provider(meta, step_key)
         if not probe.is_configured():
-            yield _evt("error", message=f"模型 {probe.name} 未配置，请检查 .env 或在该产出处切换模型。")
+            yield _evt("error", message=f"模型「{probe.label}」未配置完整，请在右上角「模型配置」面板补全，或在该产出处切换模型。")
             return
     except ProviderError as e:
         yield _evt("error", message=str(e))
