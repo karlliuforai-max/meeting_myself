@@ -1112,3 +1112,58 @@ input[type="file"] {
 .mc-actions button:not(.primary):not(.danger):hover {
   border-color: var(--clay);
 }
+
+/* ---------- 产出版本切换器 ---------- */
+.version-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 12px 0 4px;
+  padding-bottom: 10px;
+  border-bottom: 1px dashed var(--border);
+}
+.ver-chip {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border-strong);
+  background: var(--ivory-card);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.ver-chip:hover {
+  border-color: var(--clay);
+}
+.ver-chip.active {
+  background: var(--clay);
+  color: #fff;
+  border-color: var(--clay);
+}
+.ver-note {
+  margin: 6px 0 0;
+  padding: 7px 11px;
+  background: var(--clay-soft);
+  border-radius: 8px;
+}
+
+/* ---------- 持续迭代修订框 ---------- */
+.revise-box {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.revise-input {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  margin-top: 0;
+  font-size: 13.5px;
+}
+.revise-box .primary {
+  flex-shrink: 0;
+  white-space: nowrap;
+}

@@ -105,3 +105,31 @@ def graph_system(pre_prompt: str) -> str:
 
 def graph_user(minutes_md: str) -> str:
     return f"课堂纪要：\n\n{minutes_md}"
+
+
+# ---------------- 通用：持续迭代修订 ----------------
+def revise_system(product_title: str, pre_prompt: str, is_graph: bool = False) -> str:
+    """对某个已生成产出按用户修订意见再生成。保持原产出的格式与结构。"""
+    fmt = (
+        "本产出是一张 Mermaid 流程图（横版 `flowchart LR`）。修订后仍只输出 Mermaid 代码，"
+        "用 ```mermaid 代码块包裹，第一行保持 `flowchart LR`，不要写 style/classDef/linkStyle，"
+        "节点含特殊字符用双引号包裹。"
+        if is_graph
+        else "本产出是 Markdown 文档。修订后输出【完整的】Markdown 正文，保持原有的章节结构与排版风格。"
+    )
+    return (
+        f"你正在迭代修订一份已生成的课堂产出：「{product_title}」。\n"
+        "下面会给你【当前版本内容】和【用户的修订意见】。请严格按修订意见调整，"
+        "只改动意见涉及之处，其余内容保持不变；不要遗漏、不要无故重写未提及的部分。\n\n"
+        f"{fmt}\n\n"
+        "安全红线：不得改动数字、金额、日期、百分比、人名、公司名、机构名；拿不准时保留原文。\n"
+        "只输出修订后的产出本身，不要加任何说明、前后缀或对改动的描述。"
+        + _bg(pre_prompt)
+    )
+
+
+def revise_user(current_content: str, instruction: str) -> str:
+    return (
+        f"【当前版本内容】\n{current_content}\n\n"
+        f"【用户的修订意见】\n{instruction.strip()}"
+    )

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
 
 from config import settings
-from pipeline import run_one_step
+from pipeline import revise_one_step, run_one_step
 from storage import session_store
 
 # (sid, step_key) → 运行态
@@ -98,8 +98,9 @@ def running_steps(sid: str) -> List[str]:
     return out
 
 
-def start_step(sid: str, step: str) -> bool:
-    """启动单步生成任务。已在跑则返回 False。"""
+def _start(sid: str, step: str, events_factory, *, tag: str) -> bool:
+    """通用任务启动：events_factory() 返回事件生成器。同一 (sid, step) 已在跑则返回 False。
+    生成与修订共用同一 step 维度（同一产出同一时间只允许一个任务）。"""
     with _LOCK:
         key = (sid, step)
         if key in _RUNS and _RUNS[key].alive:
@@ -109,7 +110,7 @@ def start_step(sid: str, step: str) -> bool:
 
     def worker():
         try:
-            for evt in run_one_step(sid, step):
+            for evt in events_factory():
                 run.emit(evt)
         except Exception as e:  # noqa: BLE001
             run.emit({"type": "error", "step": step,
@@ -122,8 +123,18 @@ def start_step(sid: str, step: str) -> bool:
                 if _RUNS.get(key) is run:
                     del _RUNS[key]
 
-    threading.Thread(target=worker, name=f"gen-{sid}-{step}", daemon=True).start()
+    threading.Thread(target=worker, name=f"{tag}-{sid}-{step}", daemon=True).start()
     return True
+
+
+def start_step(sid: str, step: str) -> bool:
+    """启动单步生成任务。已在跑则返回 False。"""
+    return _start(sid, step, lambda: run_one_step(sid, step), tag="gen")
+
+
+def start_revise(sid: str, step: str, instruction: str) -> bool:
+    """启动单步修订任务（基于当前产出 + 修订意见 → 新版本）。已在跑则返回 False。"""
+    return _start(sid, step, lambda: revise_one_step(sid, step, instruction), tag="rev")
 
 
 def subscribe(sid: str, step: str) -> Iterator[dict]:

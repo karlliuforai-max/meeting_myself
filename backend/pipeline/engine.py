@@ -191,6 +191,60 @@ def run_one_step(session_id: str, step_key: str) -> Iterator[dict]:
         yield _evt("error", step=step_key, message=f"处理出错：{e}")
 
 
+# ---------- 持续迭代修订（基于当前产出 + 用户意见 → 新版本）----------
+def revise_one_step(session_id: str, step_key: str, instruction: str) -> Iterator[dict]:
+    meta = session_store.get(session_id)
+    if not meta:
+        yield _evt("error", message="会话不存在")
+        return
+
+    step_def = _step_def(step_key)
+    if not step_def:
+        yield _evt("error", message=f"未知步骤：{step_key}")
+        return
+
+    instruction = (instruction or "").strip()
+    if not instruction:
+        yield _evt("error", step=step_key, message="请填写修订意见。")
+        return
+
+    out_name = _step_output_for_key(step_key)
+    current = _read_artifact_or_legacy(session_id, out_name)
+    if not current:
+        yield _evt("error", step=step_key, message=f"「{step_def.title}」尚未生成，无法修订。")
+        return
+
+    # 预检模型
+    try:
+        prov, model = _resolve_provider(meta, step_key)
+        if not prov.is_configured():
+            yield _evt("error", step=step_key,
+                       message=f"模型「{prov.label}」未配置完整，请在右上角「模型配置」面板补全。")
+            return
+    except ProviderError as e:
+        yield _evt("error", step=step_key, message=str(e))
+        return
+
+    is_graph = step_key == "graph"
+    yield _evt("start", step=step_key, message=f"修订：{step_def.title}")
+    yield _evt("step", step=step_key, percent=20, message="按修订意见再生成…")
+
+    try:
+        sys_p = prompts.revise_system(step_def.title, meta.pre_prompt or "", is_graph=is_graph)
+        user_p = prompts.revise_user(current, instruction)
+        revised = _call(prov, model, sys_p, user_p, temperature=0.3, max_tokens=4096)
+        if is_graph:
+            revised = _extract_mermaid(revised)
+        version = session_store.write_artifact(session_id, out_name, revised, note=f"修订：{instruction}")
+        yield _evt("artifact", step=step_key, name=out_name)
+        yield _evt("step", step=step_key, percent=100, message=f"修订完成（v{version}）")
+        yield _evt("done", step=step_key, message=f"{step_def.title} 已更新到 v{version}")
+    except ProviderError as e:
+        yield _evt("error", step=step_key, message=f"模型调用失败：{e}")
+    except Exception as e:  # noqa: BLE001
+        yield _evt("error", step=step_key, message=f"修订出错：{e}")
+
+
 # ---------- 各步骤实现 ----------
 def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
     raw = session_store.read_text_inputs(sid)

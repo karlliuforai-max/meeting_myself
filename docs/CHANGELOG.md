@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.4.0 — 2026-06-15
+
+### P2 持续迭代修订：产出可反复打磨 + 版本历史
+
+#### 新功能
+- **持续迭代修订**：每个产出（实录/纲目/撷要/笺注/脉络）下方常驻修订框，填入修订意见后基于**当前版本内容 + 意见**再生成，结果存为**新版本**，版本 note 即修订意见。
+- **版本切换器**：产出有 ≥2 版本时出现 v1/v2/… 标签（当前版高亮），可查看任意历史版本（只读，并显示当时的修订意见）。
+- **恢复历史版本**：查看旧版本时可「恢复此版本为当前」（写成一个新版本，历史不抹除）。
+- 修订复用既有 runner / SSE 进度通道；同一产出同一时间只允许一个任务（生成或修订）。
+
+#### API
+- `POST /api/sessions/{id}/revise-step?step=X` body `{instruction}`：启动单步修订（幂等，进度复用 `run-step-stream`）
+- `POST /api/sessions/{id}/artifacts/{name}/versions/{v}/restore`：恢复某历史版本为当前
+
+#### 提示词与安全
+- 新增通用修订提示词（`prompts.revise_system/revise_user`）：保持原产出格式与结构、只改意见涉及处；脉络图特例仍输出 `flowchart LR` Mermaid。
+- 安全红线沿用：不改动数字/金额/日期/人名/公司名。实测修订「8.5%」等数字被正确保留。
+
+#### 内部
+- `pipeline/engine.py` 新增 `revise_one_step`；`runner.py` 抽出通用 `_start`，新增 `start_revise`。
+
 ## v0.3.0 — 2026-06-15
 
 ### 模型配置中心：Provider 从 .env 静态配置 → 运行时可视化管理

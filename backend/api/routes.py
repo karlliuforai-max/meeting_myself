@@ -229,6 +229,24 @@ def start_run_step(sid: str, step: str) -> dict:
     return {"started": started, "already_running": not started, "sid": sid, "step": step}
 
 
+class ReviseStepReq(BaseModel):
+    instruction: str
+
+
+@router.post("/sessions/{sid}/revise-step")
+def start_revise_step(sid: str, step: str, req: ReviseStepReq) -> dict:
+    """启动单步修订：基于当前产出 + 修订意见再生成新版本。
+    幂等：同一 (sid, step) 已在跑（生成或修订）就返回 already_running=True。
+    进度复用 GET /run-step-stream?step=X（SSE）。
+    """
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    if not (req.instruction or "").strip():
+        raise HTTPException(400, "请填写修订意见")
+    started = runner.start_revise(sid, step, req.instruction)
+    return {"started": started, "already_running": not started, "sid": sid, "step": step}
+
+
 @router.get("/sessions/{sid}/run-step-stream")
 def run_step_stream(sid: str, step: str) -> StreamingResponse:
     """订阅单步生成进度（SSE）。已结束则一次性回放历史。"""
@@ -308,6 +326,18 @@ def get_artifact_version(sid: str, name: str, version: int) -> dict:
     if content is None:
         raise HTTPException(404, "该版本不存在")
     return {"name": name, "version": version, "content": content}
+
+
+@router.post("/sessions/{sid}/artifacts/{name}/versions/{version}/restore")
+def restore_artifact_version(sid: str, name: str, version: int) -> dict:
+    """把某历史版本恢复为当前（写成一个新版本，不抹掉历史）。"""
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    content = session_store.read_version(sid, name, version)
+    if content is None:
+        raise HTTPException(404, "该版本不存在")
+    new_version = session_store.write_artifact(sid, name, content, note=f"恢复自 v{version}")
+    return {"name": name, "restored_from": version, "version": new_version, "content": content}
 
 
 # ---------- 助手 ----------

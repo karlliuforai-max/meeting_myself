@@ -57,9 +57,21 @@ export const api = {
     }),
   getArtifact: (id, name) =>
     req(`/sessions/${id}/artifacts/${encodeURIComponent(name)}`),
+  getArtifactVersion: (id, name, version) =>
+    req(`/sessions/${id}/artifacts/${encodeURIComponent(name)}/versions/${version}`),
+  restoreVersion: (id, name, version) =>
+    req(`/sessions/${id}/artifacts/${encodeURIComponent(name)}/versions/${version}/restore`, {
+      method: "POST",
+    }),
   // 单步生成
   startStep: (id, step) =>
     req(`/sessions/${id}/run-step?step=${step}`, { method: "POST" }),
+  // 单步修订（基于当前产出 + 修订意见 → 新版本）；进度复用 stepStream
+  reviseStep: (id, step, instruction) =>
+    req(`/sessions/${id}/revise-step?step=${step}`, {
+      method: "POST",
+      body: JSON.stringify({ instruction }),
+    }),
   // 单步进度流（SSE）
   stepStream: (id, step) =>
     new EventSource(`/api/sessions/${id}/run-step-stream?step=${step}`),

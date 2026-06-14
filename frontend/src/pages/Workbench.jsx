@@ -24,6 +24,10 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
   const [stepStatus, setStepStatus] = useState({}); // step.key → {running, percent, message, err}
   const [editingTitle, setEditingTitle] = useState(false); // 是否在改项目名
   const [editingFile, setEditingFile] = useState(null); // 正在改名的文件原名（null=无）
+  const [versions, setVersions] = useState({}); // step.key → [{version, note}]
+  const [viewVersion, setViewVersion] = useState({}); // step.key → 0(当前) | 历史版本号
+  const [viewContent, setViewContent] = useState({}); // step.key → 历史版本内容
+  const [reviseText, setReviseText] = useState({}); // step.key → 修订意见输入
 
   const fileRef = useRef(null);
   const esRefs = useRef({});
@@ -37,9 +41,10 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
       setPrePrompt(s.pre_prompt || "");
       module.steps.forEach((step) => {
         if ((s.artifacts || []).includes(step.output_name)) {
-          api.getArtifact(sessionId, step.output_name).then((a) =>
-            setArtifacts((m) => ({ ...m, [step.key]: a.content }))
-          );
+          api.getArtifact(sessionId, step.output_name).then((a) => {
+            setArtifacts((m) => ({ ...m, [step.key]: a.content }));
+            setVersions((m) => ({ ...m, [step.key]: a.versions || [] }));
+          });
         }
       });
     });
@@ -159,6 +164,8 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
       } else if (evt.type === "artifact") {
         api.getArtifact(sessionId, evt.name).then((a) => {
           setArtifacts((m) => ({ ...m, [stepKey]: a.content }));
+          setVersions((m) => ({ ...m, [stepKey]: a.versions || [] }));
+          setViewVersion((m) => ({ ...m, [stepKey]: 0 })); // 生成/修订后回到最新
           load();
         });
       } else if (evt.type === "done") {
@@ -185,6 +192,47 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
       return;
     }
     attachStream(stepKey);
+  }
+
+  async function revise(stepKey) {
+    const instruction = (reviseText[stepKey] || "").trim();
+    if (!instruction) return;
+    setStatus(stepKey, { running: true, percent: 0, message: "提交修订…", err: "" });
+    try {
+      await api.reviseStep(sessionId, stepKey, instruction);
+    } catch (e) {
+      setStatus(stepKey, { running: false, err: e.message });
+      return;
+    }
+    setReviseText((m) => ({ ...m, [stepKey]: "" }));
+    attachStream(stepKey); // 复用同一 SSE 通道
+  }
+
+  async function viewVersionFn(stepKey, name, v) {
+    if (v === 0) {
+      setViewVersion((m) => ({ ...m, [stepKey]: 0 }));
+      return;
+    }
+    try {
+      const a = await api.getArtifactVersion(sessionId, name, v);
+      setViewContent((m) => ({ ...m, [stepKey]: a.content }));
+      setViewVersion((m) => ({ ...m, [stepKey]: v }));
+    } catch (e) {
+      alert("读取版本失败：" + e.message);
+    }
+  }
+
+  async function restoreVersionFn(stepKey, name, v) {
+    if (!confirm(`恢复 v${v} 为当前版本？会生成一个新版本，历史仍保留。`)) return;
+    try {
+      const a = await api.restoreVersion(sessionId, name, v);
+      setArtifacts((m) => ({ ...m, [stepKey]: a.content }));
+      setViewVersion((m) => ({ ...m, [stepKey]: 0 }));
+      const fresh = await api.getArtifact(sessionId, name);
+      setVersions((m) => ({ ...m, [stepKey]: fresh.versions || [] }));
+    } catch (e) {
+      alert("恢复失败：" + e.message);
+    }
   }
 
   async function changeStepModel(stepKey, provider, model) {
@@ -226,6 +274,12 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
   const activeProviderName = activeModel.provider || defaultProvider?.name || "";
   const activeProvider = providers.find((p) => p.name === activeProviderName);
   const activeModelName = activeModel.model || activeProvider?.default_model || "";
+  // 版本：0 = 当前最新（artifacts），否则查看某历史版本（只读）
+  const activeVersions = versions[activeStep.key] || [];
+  const activeViewVersion = viewVersion[activeStep.key] || 0;
+  const viewingHistory = activeViewVersion !== 0;
+  const displayedContent = viewingHistory ? viewContent[activeStep.key] : activeContent;
+  const latestVersionNo = activeVersions.length;
 
   return (
     <div className="workbench">
@@ -424,9 +478,70 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
             )}
             {activeStatus.err && <div className="banner error">{activeStatus.err}</div>}
 
+            {/* 版本切换器（≥2 版本时出现）*/}
+            {activeContent && activeVersions.length > 1 && (
+              <div className="version-bar">
+                <span className="muted small">版本</span>
+                {activeVersions.map((v) => {
+                  const isLatest = v.version === latestVersionNo;
+                  const isActive = activeViewVersion === v.version || (activeViewVersion === 0 && isLatest);
+                  return (
+                    <button
+                      key={v.version}
+                      className={"ver-chip" + (isActive ? " active" : "")}
+                      title={v.note || ""}
+                      onClick={() => viewVersionFn(activeStep.key, activeStep.output_name, isLatest ? 0 : v.version)}
+                    >
+                      v{v.version}{isLatest ? " · 当前" : ""}
+                    </button>
+                  );
+                })}
+                {viewingHistory && (
+                  <>
+                    <span style={{ flex: 1 }} />
+                    <button
+                      className="link small"
+                      onClick={() => restoreVersionFn(activeStep.key, activeStep.output_name, activeViewVersion)}
+                    >
+                      恢复此版本为当前
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+            {viewingHistory && (
+              <div className="ver-note muted small">
+                📝 正在查看历史版本 v{activeViewVersion}
+                {activeVersions.find((v) => v.version === activeViewVersion)?.note
+                  ? `：${activeVersions.find((v) => v.version === activeViewVersion).note}`
+                  : ""}
+              </div>
+            )}
+
             <div className="panel-content">
-              <OutputView name={activeStep.output_name} content={activeContent} />
+              <OutputView name={activeStep.output_name} content={displayedContent} />
             </div>
+
+            {/* 持续迭代修订框：已有产出且在看最新版时可用 */}
+            {activeContent && !viewingHistory && activeDep.ok && (
+              <div className="revise-box">
+                <textarea
+                  className="revise-input"
+                  rows={2}
+                  placeholder={`对「${activeStep.title}」提修订意见，例如：术语表补充 WACC；第三节展开一些；语气更正式…（不会改动数字/人名/公司名）`}
+                  value={reviseText[activeStep.key] || ""}
+                  onChange={(e) => setReviseText((m) => ({ ...m, [activeStep.key]: e.target.value }))}
+                  disabled={activeStatus.running}
+                />
+                <button
+                  className="primary"
+                  disabled={activeStatus.running || !(reviseText[activeStep.key] || "").trim()}
+                  onClick={() => revise(activeStep.key)}
+                >
+                  {activeStatus.running ? "修订中…" : "提交修订"}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </section>
