@@ -5,12 +5,15 @@
 """
 from __future__ import annotations
 
+import json
 from typing import List, Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from modules import get_module, list_modules
+from pipeline import available_artifacts, run_stream, runner
 from providers import Message, ProviderError, get_provider, list_providers
 from storage import session_store
 
@@ -20,7 +23,7 @@ router = APIRouter(prefix="/api")
 # ---------- 健康检查 ----------
 @router.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "meeting-minutes", "phase": "P0"}
+    return {"status": "ok", "service": "meeting-minutes", "phase": "P1"}
 
 
 # ---------- 板块 ----------
@@ -125,10 +128,108 @@ async def upload_inputs(sid: str, files: List[UploadFile] = File(...)) -> dict:
     return {"saved": saved, "inputs": session_store.list_inputs(sid)}
 
 
+@router.delete("/sessions/{sid}/inputs/{filename}")
+def delete_input(sid: str, filename: str) -> dict:
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    if not session_store.delete_input(sid, filename):
+        raise HTTPException(404, "文件不存在或文件名非法")
+    return {"deleted": filename, "inputs": session_store.list_inputs(sid)}
+
+
+class RenameInputReq(BaseModel):
+    new_name: str
+
+
+@router.put("/sessions/{sid}/inputs/{filename}")
+def rename_input(sid: str, filename: str, req: RenameInputReq) -> dict:
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    new_name = session_store.rename_input(sid, filename, req.new_name)
+    if not new_name:
+        raise HTTPException(400, "重命名失败：源文件不存在 / 名称非法 / 目标已存在")
+    return {"renamed": {"from": filename, "to": new_name}, "inputs": session_store.list_inputs(sid)}
+
+
+# ---------- 生成（按步骤独立运行 + SSE 订阅）----------
+@router.post("/sessions/{sid}/run-step")
+def start_run_step(sid: str, step: str) -> dict:
+    """启动单步生成任务。step ∈ transcript/chapters/minutes_concise/minutes_detailed/graph。
+    幂等：同一 (sid, step) 已在跑就返回 already_running=True。
+    """
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    started = runner.start_step(sid, step)
+    return {"started": started, "already_running": not started, "sid": sid, "step": step}
+
+
+@router.get("/sessions/{sid}/run-step-stream")
+def run_step_stream(sid: str, step: str) -> StreamingResponse:
+    """订阅单步生成进度（SSE）。已结束则一次性回放历史。"""
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+
+    def gen():
+        try:
+            for evt in runner.subscribe(sid, step):
+                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+        except Exception as e:  # noqa: BLE001
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/sessions/{sid}/progress")
+def get_progress(sid: str) -> dict:
+    """一次性拉取所有步骤的进度（让前端首屏一次性恢复全部状态）。"""
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    steps = ["transcript", "chapters", "minutes_concise", "minutes_detailed", "graph"]
+    return {
+        "running": runner.running_steps(sid),
+        "by_step": {s: runner.load_history(sid, s) for s in steps},
+    }
+
+
+# ---------- 步骤模型配置（每个产出独立选模型）----------
+class StepModelReq(BaseModel):
+    step: str
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+@router.put("/sessions/{sid}/step-model")
+def set_step_model(sid: str, req: StepModelReq) -> dict:
+    """设置某步骤使用的模型。provider/model 留空 = 重置为默认。"""
+    meta = session_store.get(sid)
+    if not meta:
+        raise HTTPException(404, "会话不存在")
+    sm = dict(meta.step_models or {})
+    if not req.provider and not req.model:
+        sm.pop(req.step, None)
+    else:
+        sm[req.step] = {"provider": req.provider, "model": req.model}
+    meta.step_models = sm
+    session_store.update(meta)
+    return {"step_models": meta.step_models}
+
+
 # ---------- 产出 / 版本 ----------
 @router.get("/sessions/{sid}/artifacts/{name}")
 def get_artifact(sid: str, name: str) -> dict:
+    # 老会话兼容：找不到新名时尝试其对应的老文件名
+    from pipeline.engine import LEGACY_NAMES
+
     content = session_store.read_artifact(sid, name)
+    if content is None:
+        for legacy in LEGACY_NAMES.get(name, []):
+            content = session_store.read_artifact(sid, legacy)
+            if content is not None:
+                break
     if content is None:
         raise HTTPException(404, "产出不存在（可能尚未生成）")
     return {"name": name, "content": content, "versions": session_store.list_versions(sid, name)}
@@ -144,13 +245,16 @@ def get_artifact_version(sid: str, name: str, version: int) -> dict:
 
 # ---------- 助手 ----------
 def _session_public(meta) -> dict:
+    # 实时扫描已存在的产出（含老文件名 → 新名 映射），不再依赖 meta.artifacts 落后状态
+    artifacts = available_artifacts(meta.id)
     return {
         "id": meta.id,
         "module": meta.module,
         "title": meta.title,
         "pre_prompt": meta.pre_prompt,
+        "step_models": meta.step_models or {},
         "status": meta.status,
-        "artifacts": meta.artifacts,
+        "artifacts": artifacts,
         "created_at": meta.created_at,
         "updated_at": meta.updated_at,
     }

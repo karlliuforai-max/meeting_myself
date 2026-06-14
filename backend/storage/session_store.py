@@ -111,6 +111,48 @@ class SessionStore:
         d = self._dir(sid) / "inputs"
         return sorted(f.name for f in d.iterdir()) if d.exists() else []
 
+    def delete_input(self, sid: str, filename: str) -> bool:
+        """删除指定输入文件。文件名走基础校验避免越界。"""
+        if "/" in filename or ".." in filename:
+            return False
+        p = self._dir(sid) / "inputs" / filename
+        if p.exists() and p.is_file():
+            p.unlink()
+            return True
+        return False
+
+    def rename_input(self, sid: str, old: str, new: str) -> Optional[str]:
+        """重命名输入文件，返回新文件名；失败返回 None。
+        保留原扩展名（前端只编辑主名），避免误改类型。
+        """
+        for s in (old, new):
+            if "/" in s or ".." in s or not s.strip():
+                return None
+        d = self._dir(sid) / "inputs"
+        src = d / old
+        if not src.exists() or not src.is_file():
+            return None
+        # 若 new 不带扩展名，沿用旧扩展名
+        new = new.strip()
+        if "." not in new:
+            new = new + src.suffix
+        dst = d / new
+        if dst.exists() and dst != src:
+            return None
+        src.rename(dst)
+        return dst.name
+
+    def read_text_inputs(self, sid: str) -> str:
+        """读取并拼接所有文本类输入（txt/md）。pdf/图片在 P3 处理。"""
+        d = self._dir(sid) / "inputs"
+        if not d.exists():
+            return ""
+        parts: List[str] = []
+        for f in sorted(d.iterdir()):
+            if f.suffix.lower() in (".txt", ".md"):
+                parts.append(f.read_text(encoding="utf-8", errors="ignore"))
+        return "\n\n".join(parts).strip()
+
     # ---- 产出（artifacts）与版本 ----
     def read_artifact(self, sid: str, name: str) -> Optional[str]:
         p = self._dir(sid) / "artifacts" / name

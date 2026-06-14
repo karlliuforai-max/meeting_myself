@@ -40,4 +40,24 @@ export const api = {
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     return res.json();
   },
+  deleteInput: (id, filename) =>
+    req(`/sessions/${id}/inputs/${encodeURIComponent(filename)}`, { method: "DELETE" }),
+  renameInput: (id, filename, new_name) =>
+    req(`/sessions/${id}/inputs/${encodeURIComponent(filename)}`, {
+      method: "PUT",
+      body: JSON.stringify({ new_name }),
+    }),
+  getArtifact: (id, name) =>
+    req(`/sessions/${id}/artifacts/${encodeURIComponent(name)}`),
+  // 单步生成
+  startStep: (id, step) =>
+    req(`/sessions/${id}/run-step?step=${step}`, { method: "POST" }),
+  // 单步进度流（SSE）
+  stepStream: (id, step) =>
+    new EventSource(`/api/sessions/${id}/run-step-stream?step=${step}`),
+  // 一次性查所有步骤的进度（用于刷新页面后恢复 UI）
+  getProgress: (id) => req(`/sessions/${id}/progress`),
+  // 设置某步骤的模型（provider/model 留空 = 重置为默认）
+  setStepModel: (id, body) =>
+    req(`/sessions/${id}/step-model`, { method: "PUT", body: JSON.stringify(body) }),
 };

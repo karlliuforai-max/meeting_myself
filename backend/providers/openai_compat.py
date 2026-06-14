@@ -61,16 +61,19 @@ class _OpenAICompatBase(BaseProvider):
 
 
 class DeepSeekProvider(_OpenAICompatBase):
+    """DeepSeek 官方 API。模型名 v4-pro / v4-flash（2026/07/24 后旧别名 deepseek-chat 等下线）。"""
+
     name = "deepseek"
+    label = "DeepSeek"  # 前端显示用
     supports_vision = False
-    default_model = "deepseek-chat"
+    default_model = "deepseek-v4-flash"
     base_url = "https://api.deepseek.com"
 
     def _api_key(self) -> Optional[str]:
         return settings.deepseek_api_key
 
     def list_models(self) -> List[str]:
-        return ["deepseek-chat", "deepseek-reasoner"]
+        return ["deepseek-v4-flash", "deepseek-v4-pro"]
 
 
 class OpenAICompatProvider(_OpenAICompatBase):

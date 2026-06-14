@@ -96,10 +96,10 @@ class ClaudeProvider(_AnthropicBase):
         return settings.anthropic_api_key
 
     def list_models(self) -> List[str]:
+        # 取消 Haiku；只保留 Opus 4.8 与 Sonnet 4.6
         return [
             "claude-opus-4-8",
             "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
         ]
 
 
@@ -152,4 +152,10 @@ class AnthropicCompatProvider(_AnthropicBase):
         )
 
     def list_models(self) -> List[str]:
-        return [self.default_model] if self.default_model else []
+        # 中转站可用模型列表：Opus 4.8 与 Sonnet 4.6（取消 Haiku）
+        # default_model（来自 .env）会作为下拉默认选中项；如果不在列表中也补进去。
+        base = ["claude-opus-4-8", "claude-sonnet-4-6"]
+        cfg = self.default_model
+        if cfg and cfg not in base:
+            base.insert(0, cfg)
+        return base
