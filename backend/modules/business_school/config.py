@@ -7,7 +7,10 @@
   ④ 笺注    minutes_detailed  依赖 ①
   ⑤ 脉络    graph             依赖 ③ 或 ④
 
-默认 provider 为 deepseek（在 .env 配置）；用户可在每个产出处独立切换。
+默认模型（用户可在每个产出处独立切换）：
+  实录 / 纲目 → deepseek-v4-flash（量大、偏体力活，用快模型）
+  撷要 / 笺注 / 脉络 → claude-sonnet-4-6（偏归纳推理，用强模型）
+默认按「首选模型名」在已配置的供应商里自动匹配（见 engine._step_default），不写死供应商 id。
 """
 from __future__ import annotations
 
@@ -24,12 +27,14 @@ MODULE = ModuleDef(
             key="transcript",
             title="实录",
             output_name="实录.md",
+            default_model="deepseek-v4-flash",
             description="基于原始转写稿，去口水词、纠正音近形近字与人名公司名术语；按 10 分钟分段。是后续一切的基础。",
         ),
         StepDef(
             key="chapters",
             title="纲目",
             output_name="纲目.md",
+            default_model="deepseek-v4-flash",
             description="基于转写原文按时间顺序梳理整堂课的主线骨架，每阶段附时间区间与核心概括；可独立于实录生成。",
         ),
         StepDef(
@@ -37,6 +42,7 @@ MODULE = ModuleDef(
             title="撷要",
             output_name="撷要.md",
             requires=["transcript"],
+            default_model="claude-sonnet-4-6",
             description="撷取课堂精华的精炼纪要，七节结构含中英术语表。便于快速回看。",
         ),
         StepDef(
@@ -44,6 +50,7 @@ MODULE = ModuleDef(
             title="笺注",
             output_name="笺注.md",
             requires=["transcript"],
+            default_model="claude-sonnet-4-6",
             description="如古籍笺注般完整深入的详尽纪要，知识点充分展开。便于深度学习。",
         ),
         StepDef(
@@ -51,6 +58,7 @@ MODULE = ModuleDef(
             title="脉络",
             output_name="脉络.mmd",
             requires_any=["minutes_concise", "minutes_detailed"],
+            default_model="claude-sonnet-4-6",
             description="把老师观点、子论点、论据画成横版思维流程图；连线标注 支撑/递进/因果/对比 等关系。",
         ),
     ],

@@ -263,17 +263,33 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     return { ok: true, hint: "" };
   }
 
+  // 该步骤未被用户覆盖时的默认 provider/model：按 step.default_model 在已配置供应商里匹配
+  // （全局默认 provider 优先），否则回退全局默认。与后端 engine._step_default 保持一致。
+  function stepDefault(step) {
+    const pref = step?.default_model || "";
+    const dp = providers.find((p) => p.is_default);
+    if (pref) {
+      if (dp && dp.configured && (dp.models || []).includes(pref)) return { provider: dp.name, model: pref };
+      const hit = providers.find((p) => p.configured && (p.models || []).includes(pref));
+      if (hit) return { provider: hit.name, model: pref };
+    }
+    return { provider: dp?.name || "", model: dp?.default_model || "" };
+  }
+
   if (!session) return <div className="empty">加载项目…</div>;
   const hasInputs = session.inputs?.length > 0;
   const activeDep = checkDeps(activeStep);
   const activeStatus = stepStatus[activeStep.key] || {};
   const activeContent = artifacts[activeStep.key];
   const activeModel = stepModels[activeStep.key] || {};
-  const defaultProvider = providers.find((p) => p.is_default);
-  const defaultModelName = defaultProvider?.default_model || "";
-  const activeProviderName = activeModel.provider || defaultProvider?.name || "";
+  const activeDefault = stepDefault(activeStep);
+  const activeProviderName = activeModel.provider || activeDefault.provider || "";
   const activeProvider = providers.find((p) => p.name === activeProviderName);
-  const activeModelName = activeModel.model || activeProvider?.default_model || "";
+  const activeModelName =
+    activeModel.model ||
+    (activeProviderName === activeDefault.provider ? activeDefault.model : "") ||
+    activeProvider?.default_model ||
+    "";
   // 版本：0 = 当前最新（artifacts），否则查看某历史版本（只读）
   const activeVersions = versions[activeStep.key] || [];
   const activeViewVersion = viewVersion[activeStep.key] || 0;
@@ -390,7 +406,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
               const sm = stepModels[step.key];
               const subText = st.running
                 ? `${st.percent || 0}% · 生成中`
-                : sm?.model || defaultModelName || "—";
+                : sm?.model || stepDefault(step).model || "—";
               return (
                 <button
                   key={step.key}

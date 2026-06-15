@@ -19,7 +19,8 @@ from config import settings
 from modules import get_module
 from modules.base import StepDef
 from modules.business_school import prompts
-from providers import Message, ProviderError, get_provider
+from providers import Message, ProviderError, build_provider, get_provider
+from providers import store as provider_store
 from storage import session_store
 
 from .transcript import clean_fallback, has_timestamps, split_by_length, strip_timestamps
@@ -40,13 +41,16 @@ LEGACY_NAMES = {
     OUT_GRAPH: ["知识图谱.mmd"],
 }
 
-CORRECT_MAX_CHARS = 2800
-SUMMARY_SINGLE_LIMIT = 16000
-SUMMARY_PART_CHARS = 8000
+CORRECT_MAX_CHARS = 10000    # 实录纠错分块大小（仍分块：为并行提速 + 抗长生成漂移/返空）
+CORRECT_MAX_TOKENS = 16000   # 单块纠错输出上限（须 ≥ 块字数对应 token，避免截断；默认 deepseek-v4-flash 支持 384K 输出）
 MAX_PARALLEL = 6
 CORRECT_RETRIES = 3          # 单块纠错的尝试次数（模型返回空/报错时重试）
-# 纲目分段：每段喂多少原文字符（越小阶段越细），与 v1 的细颗粒度对齐
+# 纲目分段：每段喂多少原文字符（越小阶段越细），与 v1 的细颗粒度对齐；各段并行生成
 CHAPTERS_SEG_CHARS = 6000
+CHAPTERS_MAX_TOKENS = 2500
+# 撷要/笺注：整篇一次成稿（依赖现代模型长上下文，不再 map-reduce）
+MINUTES_CONCISE_MAX_TOKENS = 4096
+MINUTES_DETAILED_MAX_TOKENS = 8000
 
 
 def _evt(type_: str, **kw) -> dict:
@@ -56,11 +60,43 @@ def _evt(type_: str, **kw) -> dict:
 
 
 def _resolve_provider(meta, step_key: str):
-    """优先用会话级覆盖（step_models[step_key]），否则用全局默认。"""
+    """解析该步骤使用的 provider/model：
+    1) 用户在该产出处手动指定（step_models[step_key]）→ 最优先；
+    2) 否则用该步骤的智能默认（StepDef.default_model，见 `_step_default`）；
+    3) 再不行回退全局默认 provider。"""
     override = (meta.step_models or {}).get(step_key, {}) or {}
-    name = override.get("provider") or None  # None → store 默认 provider
-    provider = get_provider(name)
-    return provider, override.get("model")
+    if override.get("provider"):
+        return get_provider(override["provider"]), override.get("model")
+    pid, model = _step_default(step_key)
+    return get_provider(pid), model
+
+
+def _step_default(step_key: str):
+    """步骤未被用户覆盖时的默认 (provider_id, model)。
+
+    在【已配置(有 key)】的 provider 中优先选「提供该步骤首选模型」者（全局默认 provider 优先匹配）；
+    找不到（如该模型对应的 provider 没配 key）则回退到全局默认 provider + 其默认模型。
+    这样既给出合理默认，又不写死具体 provider id（兼容用户自定义的供应商配置）。
+    """
+    sd = _step_def(step_key)
+    pref = sd.default_model if sd else ""
+    if pref:
+        did = provider_store.default_id()
+        configs = sorted(provider_store.list_configs(), key=lambda c: 0 if c["id"] == did else 1)
+        for c in configs:
+            if pref in (c.get("models") or []) and build_provider(c).is_configured():
+                return c["id"], pref
+    return (provider_store.default_id() or None), None
+
+
+def _parallel_map(fn, items: list) -> list:
+    """并行执行 fn(item)，按输入顺序返回结果（并发上限 MAX_PARALLEL）。"""
+    results: List[Optional[object]] = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+        futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
+        for fut in futs:
+            results[futs[fut]] = fut.result()
+    return results
 
 
 def _call(provider, model, system: str, user: str, *, temperature: float, max_tokens: int) -> str:
@@ -83,7 +119,7 @@ def _correct_chunk(provider, model, sys_p: str, chunk: str, *, tries: int = CORR
     user = prompts.transcript_user(cleaned)
     for attempt in range(tries):
         try:
-            txt = _call(provider, model, sys_p, user, temperature=0.2, max_tokens=4096)
+            txt = _call(provider, model, sys_p, user, temperature=0.2, max_tokens=CORRECT_MAX_TOKENS)
         except ProviderError:
             txt = ""
         if txt.strip():
@@ -393,30 +429,23 @@ def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str,
     source = raw_text if (has_ts and raw_text.strip()) else (transcript_md or raw_text)
     seg_sys = prompts.chapters_segment_system(pre)
     segs = split_by_length(source, CHAPTERS_SEG_CHARS) or [source]
-    outs = [
-        _call(provider, model, seg_sys, prompts.chapters_user(seg),
-              temperature=0.4, max_tokens=2500)
-        for seg in segs
-    ]
-    return _renumber_stages("\n\n".join(o.strip() for o in outs if o.strip()))
+    outs = _parallel_map(
+        lambda seg: _call(provider, model, seg_sys, prompts.chapters_user(seg),
+                          temperature=0.4, max_tokens=CHAPTERS_MAX_TOKENS),
+        segs,
+    )
+    return _renumber_stages("\n\n".join(o.strip() for o in outs if o and o.strip()))
 
 
 def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str, chapters_md: str) -> str:
+    """整篇一次成稿（依赖现代模型长上下文）：把完整实录(+纲目)一次喂给模型，
+    避免 map-reduce 丢上下文/丢跨段关联。超出所选模型上下文时由 provider 直接报错，
+    用户改用大上下文模型即可（不再静默降级）。"""
     system = prompts.minutes_system(pre, detail_level)
-    if len(transcript_md) <= SUMMARY_SINGLE_LIMIT:
-        return _call(provider, model, system,
-                     prompts.minutes_user(transcript_md, chapters_md or None),
-                     temperature=0.4, max_tokens=4096)
-    parts = split_by_length(transcript_md, SUMMARY_PART_CHARS)
-    map_sys = (
-        "从下面这段课堂逐字稿中，提取要点（核心知识点/框架、案例与数据、金句、术语）。"
-        "用简洁条目列出，忠于原文，不要杜撰。"
-    )
-    notes = [_call(provider, model, map_sys, p, temperature=0.3, max_tokens=2000) for p in parts]
-    merged = "【各段要点汇总】\n" + "\n\n".join(notes)
+    max_tokens = MINUTES_DETAILED_MAX_TOKENS if detail_level == "detailed" else MINUTES_CONCISE_MAX_TOKENS
     return _call(provider, model, system,
-                 prompts.minutes_user(merged, chapters_md or None),
-                 temperature=0.4, max_tokens=4096)
+                 prompts.minutes_user(transcript_md, chapters_md or None),
+                 temperature=0.4, max_tokens=max_tokens)
 
 
 def _extract_mermaid(text: str) -> str:
