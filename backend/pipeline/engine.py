@@ -327,8 +327,12 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
 
 
 def _step_chapters(sid: str, meta, pre: str) -> Iterator[dict]:
+    # 纲目可独立于实录生成（基于转写原文）：原文优先，实录仅作无时间戳时的备用文本
     transcript_md = _read_artifact_or_legacy(sid, OUT_TRANSCRIPT) or ""
     raw = session_store.read_text_inputs(sid)
+    if not raw.strip() and not transcript_md.strip():
+        yield _evt("error", step="chapters", message="未找到转写原文（请上传 txt/md 文件）。")
+        return
     has_ts = has_timestamps(raw)
     yield _evt("step", step="chapters", percent=10,
                message="分段细梳章节…" + ("（带原文时间戳）" if has_ts else "（原稿无时间戳，时间留空）"))

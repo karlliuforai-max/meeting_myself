@@ -1,8 +1,8 @@
 """商学院课堂讲座板块（暂名"学堂"）配置。
 
 五个产出（文艺命名 · 一脉相承的知识叙事）：
-  ① 实录    transcript        基础，后续一切的前置
-  ② 纲目    chapters          依赖 ①
+  ① 实录    transcript        基于转写原文，可独立生成
+  ② 纲目    chapters          基于转写原文独立归纳，无前置依赖（可与实录并行生成）
   ③ 撷要    minutes_concise   依赖 ①
   ④ 笺注    minutes_detailed  依赖 ①
   ⑤ 脉络    graph             依赖 ③ 或 ④
@@ -30,8 +30,7 @@ MODULE = ModuleDef(
             key="chapters",
             title="纲目",
             output_name="纲目.md",
-            requires=["transcript"],
-            description="按时间顺序梳理整堂课的主线骨架，每阶段附时间区间与核心概括。",
+            description="基于转写原文按时间顺序梳理整堂课的主线骨架，每阶段附时间区间与核心概括；可独立于实录生成。",
         ),
         StepDef(
             key="minutes_concise",
