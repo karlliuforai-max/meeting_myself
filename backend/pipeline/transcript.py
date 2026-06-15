@@ -150,6 +150,34 @@ def has_timestamps(text: str) -> bool:
     return False
 
 
+def transcript_duration_seconds(text: str) -> Optional[int]:
+    """根据原稿里的首末时间戳估算课堂时长；不足两个时间点时返回 None。"""
+    seconds: List[int] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _SRT.match(line):
+            seconds.extend(
+                _to_seconds(m.group(1), m.group(2), m.group(3))
+                for m in _TS_INNER.finditer(line)
+            )
+            continue
+
+        sp, speaker_sec, speaker_body = _match_speaker(line)
+        if speaker_sec is not None:
+            seconds.append(speaker_sec)
+        body = speaker_body if sp is not None else line
+        m = _TS.match(body)
+        if m:
+            seconds.append(_to_seconds(m.group(1), m.group(2), m.group(3)))
+
+    if len(seconds) < 2:
+        return None
+    duration = max(seconds) - min(seconds)
+    return duration if duration > 0 else None
+
+
 def split_by_length(text: str, max_chars: int = 1800) -> List[str]:
     """按句子边界把长文本切成不超过 max_chars 的块。"""
     if len(text) <= max_chars:

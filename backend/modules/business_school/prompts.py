@@ -47,17 +47,24 @@ def transcript_user(chunk_text: str) -> str:
 
 
 # ---------------- Step 2：章节稿 ----------------
-def chapters_segment_system(pre_prompt: str) -> str:
+def chapters_segment_system(
+    pre_prompt: str,
+    target_stages: int,
+    min_stages: int,
+    max_stages: int,
+) -> str:
     return (
-        "你是课堂内容结构分析师。下面给你整堂课【按时间先后】的内容（可能是全部，也可能是其中一段）；"
+        "你是课堂内容结构分析师。下面给你整堂课【按时间先后】的一段内容；"
         "文中可能夹带说话人标签与时间戳（如「发言人1 00:23:56」「[12:30]」）。\n"
-        "请把这段内容按讲述逻辑【细致地】划分为多个阶段——颗粒度要细，宁可分得多一些，"
-        "每个阶段聚焦一个小主题 / 一个论点 / 一个案例。用 Markdown，每个阶段格式：\n\n"
+        f"整堂课的最终纲目计划约 {target_stages} 个阶段，可接受范围为 {min_stages}-{max_stages} 个。"
+        "你当前只处理其中一段，系统会在最后统一汇编、合并跨段重复主题。\n"
+        "请按【主线层级】划分：一个阶段应承载一个完整议题、论证环节或案例单元；"
+        "不要把同一论点下的每个例子、追问、补充说明单独拆成阶段。用 Markdown，每个阶段格式：\n\n"
         "### 阶段N：阶段主题（时间区间）\n"
         "（2-4 句话概括该阶段核心内容）\n\n"
         "【要求】\n"
         "1) 编号在本段内从 1 开始顺序排即可（系统会跨段统一重排全局序号，你不必关心全局编号）。\n"
-        "2) 务必【细分】、贴着内容推进走，不要笼统合并成一两个大阶段。\n"
+        "2) 相邻内容若服务于同一中心论点，应合并为一个阶段；只有讲述目标明显转向时才新开阶段。\n"
         "3) 时间区间：用内容里出现的时间戳标注每个阶段的起止时间，形如 (00:23–03:20)；"
         "本段没有任何时间戳就留空括号 ()。【不要臆造时间】。\n"
         "4) 不要照搬「发言人N」这类机器标注（常不准），聚焦内容主题本身。\n"
@@ -66,8 +73,51 @@ def chapters_segment_system(pre_prompt: str) -> str:
     )
 
 
-def chapters_user(body: str) -> str:
-    return f"课堂内容（按时间先后）：\n\n{body}"
+def chapters_user(
+    body: str,
+    segment_index: int,
+    segment_count: int,
+    segment_budget: int,
+) -> str:
+    return (
+        f"这是整堂课的第 {segment_index}/{segment_count} 段。"
+        f"请输出【恰好 {segment_budget} 个】候选阶段；不要为了凑数量拆散同一论点。\n\n"
+        f"课堂内容（按时间先后）：\n\n{body}"
+    )
+
+
+def chapters_merge_system(
+    pre_prompt: str,
+    target_stages: int,
+    min_stages: int,
+    max_stages: int,
+) -> str:
+    return (
+        "你是课堂纲目的总编辑。下面是按原文分段并行生成的候选纲目，顺序已经与课堂时间一致。"
+        "请把它汇编为一份完整、连续、层级适中的最终纲目。\n\n"
+        f"阶段总数以 {target_stages} 个为最佳目标，必须控制在 {min_stages}-{max_stages} 个之间，"
+        "且任何情况下不得少于 20 个或多于 50 个。\n"
+        "重点处理分段边界：合并主题相同或属于同一论证链的相邻阶段；"
+        "不要把单个例子、简短问答、补充说明提升为独立阶段；"
+        "也不要把不同核心议题粗暴揉成一段。\n"
+        "合并阶段时，时间区间取所覆盖内容的最早开始与最晚结束；没有可靠时间就保留空括号，绝不臆造。\n"
+        "每个阶段保留 2-4 句话，概括中心问题、关键论点与必要案例。"
+        "阶段编号从 1 连续排列，格式严格为：\n\n"
+        "### 阶段N：阶段主题（时间区间）\n"
+        "（2-4 句话概括）\n\n"
+        "只输出最终阶段列表，不要前后说明。"
+        + _bg(pre_prompt)
+    )
+
+
+def chapters_merge_user(candidate_outline: str, observed_count: Optional[int] = None) -> str:
+    correction = ""
+    if observed_count is not None:
+        correction = (
+            f"\n\n【上次汇编得到 {observed_count} 个阶段，不符合数量要求。"
+            "这次必须严格落入指定范围。】"
+        )
+    return f"【候选纲目】\n{candidate_outline}{correction}"
 
 
 # ---------------- Step 3：纪要主体 ----------------

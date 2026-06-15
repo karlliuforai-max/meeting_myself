@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +24,13 @@ from providers import Message, ProviderError, build_provider, get_provider
 from providers import store as provider_store
 from storage import session_store
 
-from .transcript import clean_fallback, has_timestamps, split_by_length, strip_timestamps
+from .transcript import (
+    clean_fallback,
+    has_timestamps,
+    split_by_length,
+    strip_timestamps,
+    transcript_duration_seconds,
+)
 
 # 各产出文件名（与 business_school/config.py 的 StepDef.output_name 对齐）
 OUT_TRANSCRIPT = "实录.md"
@@ -45,9 +52,14 @@ CORRECT_MAX_CHARS = 10000    # 实录纠错分块大小（仍分块：为并行�
 CORRECT_MAX_TOKENS = 16000   # 单块纠错输出上限（须 ≥ 块字数对应 token，避免截断；默认 deepseek-v4-flash 支持 384K 输出）
 MAX_PARALLEL = 6
 CORRECT_RETRIES = 3          # 单块纠错的尝试次数（模型返回空/报错时重试）
-# 纲目分段：每段喂多少原文字符（越小阶段越细），与 v1 的细颗粒度对齐；各段并行生成
+# 纲目：分段并行提取候选阶段，再按课堂长度汇编为 20-50 个最终阶段
 CHAPTERS_SEG_CHARS = 6000
-CHAPTERS_MAX_TOKENS = 2500
+CHAPTERS_SEGMENT_MAX_TOKENS = 4000
+CHAPTERS_FINAL_MAX_TOKENS = 7000
+CHAPTERS_MIN_STAGES = 20
+CHAPTERS_MAX_STAGES = 50
+CHAPTERS_MINUTES_PER_STAGE = 6
+CHAPTERS_CHARS_PER_STAGE = 1800
 # 撷要/笺注：整篇一次成稿（依赖现代模型长上下文，不再 map-reduce）
 MINUTES_CONCISE_MAX_TOKENS = 4096
 MINUTES_DETAILED_MAX_TOKENS = 8000
@@ -141,6 +153,70 @@ def _renumber_stages(md: str) -> str:
         return f"### 阶段{counter['n']}"
 
     return _STAGE_HEADING.sub(repl, md).strip() + "\n"
+
+
+def _count_stages(md: str) -> int:
+    return len(_STAGE_HEADING.findall(md or ""))
+
+
+def _target_chapter_stages(source: str, has_ts: bool) -> int:
+    """按课堂时长估算阶段数；无可靠时间戳时用正文长度代理。"""
+    duration = transcript_duration_seconds(source) if has_ts else None
+    if duration:
+        estimate = round(duration / 60 / CHAPTERS_MINUTES_PER_STAGE)
+    else:
+        content_chars = len(re.sub(r"\s+", "", source or ""))
+        estimate = round(content_chars / CHAPTERS_CHARS_PER_STAGE)
+    return max(CHAPTERS_MIN_STAGES, min(CHAPTERS_MAX_STAGES, estimate))
+
+
+def _chapter_stage_range(target: int) -> tuple[int, int]:
+    margin = max(2, round(target * 0.15))
+    return (
+        max(CHAPTERS_MIN_STAGES, target - margin),
+        min(CHAPTERS_MAX_STAGES, target + margin),
+    )
+
+
+def _coalesce_segments(segments: list[str], max_segments: int) -> list[str]:
+    """相邻合并，确保分段数不超过阶段预算（每段至少能分到 1 个候选阶段）。"""
+    if len(segments) <= max_segments:
+        return segments
+    out: list[str] = []
+    total = len(segments)
+    for i in range(max_segments):
+        start = round(i * total / max_segments)
+        end = round((i + 1) * total / max_segments)
+        out.append("\n".join(segments[start:end]))
+    return out
+
+
+def _allocate_stage_budgets(segments: list[str], target: int) -> list[int]:
+    """按分段长度分配整数阶段配额，总和严格等于 target，且每段至少 1 个。"""
+    if not segments:
+        return []
+    if len(segments) > target:
+        raise ValueError("segment count cannot exceed stage target")
+
+    budgets = [1] * len(segments)
+    remaining = target - len(segments)
+    if remaining <= 0:
+        return budgets
+
+    lengths = [max(1, len(seg)) for seg in segments]
+    total = sum(lengths)
+    raw_shares = [remaining * length / total for length in lengths]
+    floors = [math.floor(share) for share in raw_shares]
+    budgets = [base + extra for base, extra in zip(budgets, floors)]
+    leftover = remaining - sum(floors)
+    order = sorted(
+        range(len(segments)),
+        key=lambda i: raw_shares[i] - floors[i],
+        reverse=True,
+    )
+    for i in order[:leftover]:
+        budgets[i] += 1
+    return budgets
 
 
 # ---------- 依赖检查 ----------
@@ -370,8 +446,11 @@ def _step_chapters(sid: str, meta, pre: str) -> Iterator[dict]:
         yield _evt("error", step="chapters", message="未找到转写原文（请上传 txt/md 文件）。")
         return
     has_ts = has_timestamps(raw)
+    source = raw if (has_ts and raw.strip()) else (transcript_md or raw)
+    target = _target_chapter_stages(source, has_ts)
     yield _evt("step", step="chapters", percent=10,
-               message="分段细梳章节…" + ("（带原文时间戳）" if has_ts else "（原稿无时间戳，时间留空）"))
+               message=f"按课堂长度规划约 {target} 个阶段…"
+                       + ("（带原文时间戳）" if has_ts else "（原稿无时间戳，时间留空）"))
     prov, model = _resolve_provider(meta, "chapters")
     chapters_md = _make_chapters(prov, model, pre, transcript_md, raw, has_ts)
     session_store.write_artifact(sid, OUT_CHAPTERS, chapters_md, note="生成")
@@ -419,22 +498,72 @@ def _assemble_transcript(results) -> str:
 
 
 def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str, has_ts: bool) -> str:
-    """分段生成细颗粒度的纲目（对齐 v1 质量），再统一重排阶段编号。
+    """按课堂长度生成 20-50 个阶段：分段并行提取，再全局汇编去碎片。
 
     - 有时间戳：用【原始稿】分段（时间戳与内容同在），每段细分阶段并标真实时间区间；
     - 无时间戳：退用实录内容分段，时间区间留空。
-    每段各自从「阶段1」起编号，拼接后由 `_renumber_stages` 重排成连续序号，
-    既保留 v1「分段输入→细分割」的颗粒度，又修掉编号乱、时间不准的问题。
+    先按时长（无时间戳时按字数）计算整堂课阶段预算，再按分段长度分配候选名额；
+    最后统一合并跨段重复主题，避免分块数量直接膨胀为最终阶段数量。
     """
     source = raw_text if (has_ts and raw_text.strip()) else (transcript_md or raw_text)
-    seg_sys = prompts.chapters_segment_system(pre)
-    segs = split_by_length(source, CHAPTERS_SEG_CHARS) or [source]
+    target = _target_chapter_stages(source, has_ts)
+    min_stages, max_stages = _chapter_stage_range(target)
+    dynamic_seg_chars = max(CHAPTERS_SEG_CHARS, math.ceil(len(source) / target))
+    segs = split_by_length(source, dynamic_seg_chars) or [source]
+    segs = _coalesce_segments(segs, target)
+    budgets = _allocate_stage_budgets(segs, target)
+    seg_sys = prompts.chapters_segment_system(pre, target, min_stages, max_stages)
+
+    def _build_segment(item) -> str:
+        index, seg, budget = item
+        return _call(
+            provider,
+            model,
+            seg_sys,
+            prompts.chapters_user(seg, index + 1, len(segs), budget),
+            temperature=0.3,
+            max_tokens=CHAPTERS_SEGMENT_MAX_TOKENS,
+        )
+
     outs = _parallel_map(
-        lambda seg: _call(provider, model, seg_sys, prompts.chapters_user(seg),
-                          temperature=0.4, max_tokens=CHAPTERS_MAX_TOKENS),
-        segs,
+        _build_segment,
+        list(zip(range(len(segs)), segs, budgets)),
     )
-    return _renumber_stages("\n\n".join(o.strip() for o in outs if o and o.strip()))
+    candidates = _renumber_stages("\n\n".join(o.strip() for o in outs if o and o.strip()))
+    if _count_stages(candidates) == 0:
+        raise ProviderError("纲目候选生成返回空内容，请重试或切换模型。")
+    merge_sys = prompts.chapters_merge_system(pre, target, min_stages, max_stages)
+
+    merged = _call(
+        provider,
+        model,
+        merge_sys,
+        prompts.chapters_merge_user(candidates),
+        temperature=0.25,
+        max_tokens=CHAPTERS_FINAL_MAX_TOKENS,
+    )
+    merged = _renumber_stages(merged)
+    merged_count = _count_stages(merged)
+    if min_stages <= merged_count <= max_stages:
+        return merged
+
+    repaired = _call(
+        provider,
+        model,
+        merge_sys,
+        prompts.chapters_merge_user(candidates, observed_count=merged_count),
+        temperature=0.2,
+        max_tokens=CHAPTERS_FINAL_MAX_TOKENS,
+    )
+    repaired = _renumber_stages(repaired)
+    repaired_count = _count_stages(repaired)
+    if min_stages <= repaired_count <= max_stages:
+        return repaired
+    if CHAPTERS_MIN_STAGES <= repaired_count <= CHAPTERS_MAX_STAGES:
+        return repaired
+    if CHAPTERS_MIN_STAGES <= merged_count <= CHAPTERS_MAX_STAGES:
+        return merged
+    return candidates
 
 
 def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str, chapters_md: str) -> str:
