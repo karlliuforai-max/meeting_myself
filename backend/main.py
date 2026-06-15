@@ -12,8 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from api.routes import router
+from config import APP_VERSION
 
-app = FastAPI(title="会议纪要生成平台", version="0.1.0")
+app = FastAPI(title="会议纪要生成平台", version=APP_VERSION)
 
 # 开发态跨域：允许本地前端访问
 app.add_middleware(

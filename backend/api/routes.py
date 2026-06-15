@@ -12,6 +12,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from config import APP_VERSION
 from modules import get_module, list_modules
 from pipeline import available_artifacts, run_stream, runner
 from providers import Message, ProviderError, build_provider, get_provider, list_providers
@@ -24,7 +25,8 @@ router = APIRouter(prefix="/api")
 # ---------- 健康检查 ----------
 @router.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "meeting-minutes", "phase": "P1"}
+    # phase 随开发进度更新；version 取自根 VERSION（单一版本源）
+    return {"status": "ok", "service": "meeting-minutes", "phase": "P2", "version": APP_VERSION}
 
 
 # ---------- 板块 ----------

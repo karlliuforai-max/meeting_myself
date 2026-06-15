@@ -22,7 +22,7 @@ from modules.business_school import prompts
 from providers import Message, ProviderError, get_provider
 from storage import session_store
 
-from .transcript import build_correction_units, split_by_length
+from .transcript import build_correction_units, build_timeline_digest, split_by_length
 
 # 各产出文件名（与 business_school/config.py 的 StepDef.output_name 对齐）
 OUT_TRANSCRIPT = "实录.md"
@@ -252,10 +252,10 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
         yield _evt("error", step="transcript", message="未找到文本转写稿（请上传 txt/md 文件）。")
         return
 
-    units, timed = build_correction_units(raw, CORRECT_MAX_CHARS)
+    units, has_speakers = build_correction_units(raw, CORRECT_MAX_CHARS)
     total = len(units)
     yield _evt("step", step="transcript", percent=2,
-               message=f"拆为 {total} 块{'（按时间戳）' if timed else ''}，并行纠错中…")
+               message=f"拆为 {total} 块{'（按发言人分段）' if has_speakers else ''}，并行纠错中…")
 
     prov, model = _resolve_provider(meta, "transcript")
     sys_p = prompts.transcript_system(pre)
@@ -277,7 +277,7 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
                        percent=2 + int(95 * done / max(total, 1)),
                        message=f"纠错 {done}/{total}")
 
-    transcript_md = _assemble_transcript(units, results, timed)
+    transcript_md = _assemble_transcript(units, results)
     session_store.write_artifact(sid, OUT_TRANSCRIPT, transcript_md, note="生成")
     yield _evt("artifact", step="transcript", name=OUT_TRANSCRIPT)
     yield _evt("step", step="transcript", percent=100, message="逐字稿完成")
@@ -285,14 +285,12 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
 
 def _step_chapters(sid: str, meta, pre: str) -> Iterator[dict]:
     transcript_md = _read_artifact_or_legacy(sid, OUT_TRANSCRIPT)
-    yield _evt("step", step="chapters", percent=10, message="梳理章节逻辑…")
+    # 实录已去掉时间戳，时间区间改从原始转写稿取锚点对位
+    timeline = build_timeline_digest(session_store.read_text_inputs(sid))
+    yield _evt("step", step="chapters", percent=10,
+               message="梳理章节逻辑…" + ("（按原文时间戳对位）" if timeline else ""))
     prov, model = _resolve_provider(meta, "chapters")
-    chapters_md = _summarize(
-        prov, model,
-        system=prompts.chapters_system(pre),
-        build_user=prompts.chapters_user,
-        body=transcript_md, max_tokens=2500,
-    )
+    chapters_md = _make_chapters(prov, model, pre, transcript_md, timeline)
     session_store.write_artifact(sid, OUT_CHAPTERS, chapters_md, note="生成")
     yield _evt("artifact", step="chapters", name=OUT_CHAPTERS)
     yield _evt("step", step="chapters", percent=100, message="章节稿完成")
@@ -329,25 +327,42 @@ def _step_graph(sid: str, meta, pre: str) -> Iterator[dict]:
 
 
 # ---------- 工具 ----------
-def _assemble_transcript(units, results, timed: bool) -> str:
-    lines: List[str] = ["# 逐字稿\n"]
-    cur_label = None
+def _assemble_transcript(units, results) -> str:
+    """拼接纠错结果：不同说话人/单元之间空行分隔；同一说话人超长发言被切分出的
+    后续片段（is_continuation）无缝接回上一段，避免连续发言被打断。"""
+    paras: List[str] = []
     for u, txt in zip(units, results):
-        txt = txt or u.text
-        if timed and u.bucket_label != cur_label:
-            cur_label = u.bucket_label
-            lines.append(f"\n## [{cur_label}]\n")
-        lines.append(txt)
-    return "\n".join(lines).strip() + "\n"
+        txt = (txt or u.text).strip()
+        if not txt:
+            continue
+        if getattr(u, "is_continuation", False) and paras:
+            paras[-1] = paras[-1].rstrip() + txt
+        else:
+            paras.append(txt)
+    body = "\n\n".join(paras).strip()
+    return f"# 实录\n\n{body}\n"
 
 
-def _summarize(provider, model, *, system: str, build_user, body: str, max_tokens: int) -> str:
-    if len(body) <= SUMMARY_SINGLE_LIMIT:
-        return _call(provider, model, system, build_user(body), temperature=0.4, max_tokens=max_tokens)
-    parts = split_by_length(body, SUMMARY_PART_CHARS)
-    outs = [_call(provider, model, system, build_user(p), temperature=0.4, max_tokens=max_tokens)
-            for p in parts]
-    return "\n\n".join(outs)
+def _make_chapters(provider, model, pre: str, transcript_md: str, timeline_digest: str) -> str:
+    """生成连续阶段的纲目。长稿走 map-reduce，避免分段各自从「阶段1」重新计数导致碎片化。"""
+    system = prompts.chapters_system(pre)
+    if len(transcript_md) <= SUMMARY_SINGLE_LIMIT:
+        return _call(provider, model, system,
+                     prompts.chapters_user(transcript_md, timeline_digest),
+                     temperature=0.4, max_tokens=3000)
+    # 长稿：先按段提炼话题脉络（不编阶段号），再【单次】汇编成贯穿全程的连续阶段
+    parts = split_by_length(transcript_md, SUMMARY_PART_CHARS)
+    map_sys = (
+        "下面是整堂课逐字稿的其中一段。请按出现先后，提炼这一段讲了哪些话题、如何推进，"
+        "用简短条目列出（每条一句话），忠于原文、不要杜撰；不要给条目编阶段号、不要写时间。"
+    )
+    notes = [_call(provider, model, map_sys, p, temperature=0.3, max_tokens=1500) for p in parts]
+    merged = "（以下为整堂课按先后顺序的话题脉络，分段汇总，请据此合并归纳为连续阶段）\n\n" + "\n\n".join(
+        f"〔第{i + 1}段〕\n{n}" for i, n in enumerate(notes)
+    )
+    return _call(provider, model, system,
+                 prompts.chapters_user(merged, timeline_digest),
+                 temperature=0.4, max_tokens=3000)
 
 
 def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str, chapters_md: str) -> str:

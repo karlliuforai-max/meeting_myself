@@ -39,7 +39,9 @@ export default function App() {
         <div className="topbar-right">
           <div className={"status " + (health ? "ok" : "down")}>
             <span className="status-dot" />
-            {health ? `后端在线 · ${health.phase}` : "后端离线"}
+            {health
+              ? `后端在线${health.version ? " · v" + health.version : ""} · ${health.phase}`
+              : "后端离线"}
           </div>
           <button className="config-btn" onClick={() => setShowConfig(true)} title="模型配置">
             <span className="config-ico">⚙</span>
