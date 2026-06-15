@@ -22,7 +22,7 @@ from modules.business_school import prompts
 from providers import Message, ProviderError, get_provider
 from storage import session_store
 
-from .transcript import build_correction_units, build_timeline_digest, split_by_length
+from .transcript import clean_fallback, has_timestamps, split_by_length, strip_timestamps
 
 # 各产出文件名（与 business_school/config.py 的 StepDef.output_name 对齐）
 OUT_TRANSCRIPT = "实录.md"
@@ -40,10 +40,13 @@ LEGACY_NAMES = {
     OUT_GRAPH: ["知识图谱.mmd"],
 }
 
-CORRECT_MAX_CHARS = 1800
+CORRECT_MAX_CHARS = 2800
 SUMMARY_SINGLE_LIMIT = 16000
 SUMMARY_PART_CHARS = 8000
 MAX_PARALLEL = 6
+CORRECT_RETRIES = 3          # 单块纠错的尝试次数（模型返回空/报错时重试）
+# 纲目分段：每段喂多少原文字符（越小阶段越细），与 v1 的细颗粒度对齐
+CHAPTERS_SEG_CHARS = 6000
 
 
 def _evt(type_: str, **kw) -> dict:
@@ -68,6 +71,40 @@ def _call(provider, model, system: str, user: str, *, temperature: float, max_to
         max_tokens=max_tokens,
     )
     return res.text.strip()
+
+
+def _correct_chunk(provider, model, sys_p: str, chunk: str, *, tries: int = CORRECT_RETRIES):
+    """纠错单块，带重试。返回 (文本, 是否降级)。
+
+    送模型前先确定性去时间戳（保留说话人标签作弱提示）。模型多次返回空或报错时，
+    用 clean_fallback 兜底（去标签+时间戳的纯正文），保证实录里【绝不残留】原始标记。
+    """
+    cleaned = strip_timestamps(chunk)
+    user = prompts.transcript_user(cleaned)
+    for attempt in range(tries):
+        try:
+            txt = _call(provider, model, sys_p, user, temperature=0.2, max_tokens=4096)
+        except ProviderError:
+            txt = ""
+        if txt.strip():
+            return txt, False
+        time.sleep(0.5 * (attempt + 1))
+    return clean_fallback(chunk), True
+
+
+# 阶段标题：把跨段拼接后乱掉的「阶段N」统一重排为连续编号
+_STAGE_HEADING = re.compile(r"(?m)^#{1,6}\s*阶段\s*[0-9０-９一二三四五六七八九十]+")
+
+
+def _renumber_stages(md: str) -> str:
+    """分段生成的纲目拼接后，按出现顺序把阶段编号重排为 1..K（统一为 `### 阶段N`）。"""
+    counter = {"n": 0}
+
+    def repl(_m):
+        counter["n"] += 1
+        return f"### 阶段{counter['n']}"
+
+    return _STAGE_HEADING.sub(repl, md).strip() + "\n"
 
 
 # ---------- 依赖检查 ----------
@@ -252,45 +289,51 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
         yield _evt("error", step="transcript", message="未找到文本转写稿（请上传 txt/md 文件）。")
         return
 
-    units, has_speakers = build_correction_units(raw, CORRECT_MAX_CHARS)
-    total = len(units)
+    chunks = split_by_length(raw, CORRECT_MAX_CHARS) or [raw]
+    total = len(chunks)
     yield _evt("step", step="transcript", percent=2,
-               message=f"拆为 {total} 块{'（按发言人分段）' if has_speakers else ''}，并行纠错中…")
+               message=f"拆为 {total} 块，并行纠错中…")
 
     prov, model = _resolve_provider(meta, "transcript")
     sys_p = prompts.transcript_system(pre)
     results: List[Optional[str]] = [None] * total
+    degraded: List[bool] = [False] * total
 
     def _do(i: int):
-        txt = _call(prov, model, sys_p, prompts.transcript_user(units[i].text),
-                    temperature=0.2, max_tokens=4096)
-        return i, txt
+        txt, deg = _correct_chunk(prov, model, sys_p, chunks[i])
+        return i, txt, deg
 
     done = 0
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
         futures = [ex.submit(_do, i) for i in range(total)]
         for fut in futures:
-            i, txt = fut.result()
+            i, txt, deg = fut.result()
             results[i] = txt
+            degraded[i] = deg
             done += 1
             yield _evt("step", step="transcript",
                        percent=2 + int(95 * done / max(total, 1)),
                        message=f"纠错 {done}/{total}")
 
-    transcript_md = _assemble_transcript(units, results)
+    transcript_md = _assemble_transcript(results)
     session_store.write_artifact(sid, OUT_TRANSCRIPT, transcript_md, note="生成")
     yield _evt("artifact", step="transcript", name=OUT_TRANSCRIPT)
+    n_deg = sum(degraded)
+    if n_deg:
+        yield _evt("step", step="transcript", percent=99,
+                   message=f"提示：{n_deg}/{total} 块模型多次返回空，已做基础清洗（去标签/时间戳）"
+                           f"但未深度纠错——可对实录单独「重新生成」重试。")
     yield _evt("step", step="transcript", percent=100, message="逐字稿完成")
 
 
 def _step_chapters(sid: str, meta, pre: str) -> Iterator[dict]:
-    transcript_md = _read_artifact_or_legacy(sid, OUT_TRANSCRIPT)
-    # 实录已去掉时间戳，时间区间改从原始转写稿取锚点对位
-    timeline = build_timeline_digest(session_store.read_text_inputs(sid))
+    transcript_md = _read_artifact_or_legacy(sid, OUT_TRANSCRIPT) or ""
+    raw = session_store.read_text_inputs(sid)
+    has_ts = has_timestamps(raw)
     yield _evt("step", step="chapters", percent=10,
-               message="梳理章节逻辑…" + ("（按原文时间戳对位）" if timeline else ""))
+               message="分段细梳章节…" + ("（带原文时间戳）" if has_ts else "（原稿无时间戳，时间留空）"))
     prov, model = _resolve_provider(meta, "chapters")
-    chapters_md = _make_chapters(prov, model, pre, transcript_md, timeline)
+    chapters_md = _make_chapters(prov, model, pre, transcript_md, raw, has_ts)
     session_store.write_artifact(sid, OUT_CHAPTERS, chapters_md, note="生成")
     yield _evt("artifact", step="chapters", name=OUT_CHAPTERS)
     yield _evt("step", step="chapters", percent=100, message="章节稿完成")
@@ -327,42 +370,31 @@ def _step_graph(sid: str, meta, pre: str) -> Iterator[dict]:
 
 
 # ---------- 工具 ----------
-def _assemble_transcript(units, results) -> str:
-    """拼接纠错结果：不同说话人/单元之间空行分隔；同一说话人超长发言被切分出的
-    后续片段（is_continuation）无缝接回上一段，避免连续发言被打断。"""
-    paras: List[str] = []
-    for u, txt in zip(units, results):
-        txt = (txt or u.text).strip()
-        if not txt:
-            continue
-        if getattr(u, "is_continuation", False) and paras:
-            paras[-1] = paras[-1].rstrip() + txt
-        else:
-            paras.append(txt)
-    body = "\n\n".join(paras).strip()
+def _assemble_transcript(results) -> str:
+    """拼接各块结果为连续正文（块内由模型语义重组发言人、块间空行衔接）。
+    results 已是纠错文本或确定性兜底文本，绝不回退到带标签/时间戳的原文。"""
+    paras = [(r or "").strip() for r in results]
+    body = "\n\n".join(p for p in paras if p).strip()
     return f"# 实录\n\n{body}\n"
 
 
-def _make_chapters(provider, model, pre: str, transcript_md: str, timeline_digest: str) -> str:
-    """生成连续阶段的纲目。长稿走 map-reduce，避免分段各自从「阶段1」重新计数导致碎片化。"""
-    system = prompts.chapters_system(pre)
-    if len(transcript_md) <= SUMMARY_SINGLE_LIMIT:
-        return _call(provider, model, system,
-                     prompts.chapters_user(transcript_md, timeline_digest),
-                     temperature=0.4, max_tokens=3000)
-    # 长稿：先按段提炼话题脉络（不编阶段号），再【单次】汇编成贯穿全程的连续阶段
-    parts = split_by_length(transcript_md, SUMMARY_PART_CHARS)
-    map_sys = (
-        "下面是整堂课逐字稿的其中一段。请按出现先后，提炼这一段讲了哪些话题、如何推进，"
-        "用简短条目列出（每条一句话），忠于原文、不要杜撰；不要给条目编阶段号、不要写时间。"
-    )
-    notes = [_call(provider, model, map_sys, p, temperature=0.3, max_tokens=1500) for p in parts]
-    merged = "（以下为整堂课按先后顺序的话题脉络，分段汇总，请据此合并归纳为连续阶段）\n\n" + "\n\n".join(
-        f"〔第{i + 1}段〕\n{n}" for i, n in enumerate(notes)
-    )
-    return _call(provider, model, system,
-                 prompts.chapters_user(merged, timeline_digest),
-                 temperature=0.4, max_tokens=3000)
+def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str, has_ts: bool) -> str:
+    """分段生成细颗粒度的纲目（对齐 v1 质量），再统一重排阶段编号。
+
+    - 有时间戳：用【原始稿】分段（时间戳与内容同在），每段细分阶段并标真实时间区间；
+    - 无时间戳：退用实录内容分段，时间区间留空。
+    每段各自从「阶段1」起编号，拼接后由 `_renumber_stages` 重排成连续序号，
+    既保留 v1「分段输入→细分割」的颗粒度，又修掉编号乱、时间不准的问题。
+    """
+    source = raw_text if (has_ts and raw_text.strip()) else (transcript_md or raw_text)
+    seg_sys = prompts.chapters_segment_system(pre)
+    segs = split_by_length(source, CHAPTERS_SEG_CHARS) or [source]
+    outs = [
+        _call(provider, model, seg_sys, prompts.chapters_user(seg),
+              temperature=0.4, max_tokens=2500)
+        for seg in segs
+    ]
+    return _renumber_stages("\n\n".join(o.strip() for o in outs if o.strip()))
 
 
 def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str, chapters_md: str) -> str:
