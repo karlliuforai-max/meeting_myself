@@ -120,6 +120,38 @@ def chapters_merge_user(candidate_outline: str, observed_count: Optional[int] = 
     return f"【候选纲目】\n{candidate_outline}{correction}"
 
 
+# ---------------- 辅助素材：课堂笔记照片转录 ----------------
+def note_transcribe_system(pre_prompt: str) -> str:
+    return (
+        "你是严谨的课堂笔记/板书识别助手。下面给你一张【课堂笔记照片】（可能是手写笔记、"
+        "板书、PPT 截图或讲义照片）。请把图中【所有可辨认的信息】如实转录为整洁的 Markdown：\n"
+        "1) 完整保留文字内容、要点层级（标题/项目符号/编号），尽量还原原有结构；\n"
+        "2) 数学公式用 LaTeX 或清晰文字描述；表格用 Markdown 表格；\n"
+        "3) 图示/流程/箭头关系：用简短文字描述其结构与指向，不要臆造细节；\n"
+        "4) 字迹模糊或无法辨认处，标注 `[字迹不清]`，【绝不猜测填补】；\n"
+        "5) 安全红线：数字、金额、日期、百分比、人名、公司名、英文术语必须照原样转录，拿不准就标 `[存疑]`。\n"
+        "只输出转录后的正文本身，不要加任何说明、评价或「这张图片显示了…」之类的开场白。"
+        + _bg(pre_prompt)
+    )
+
+
+def note_transcribe_user() -> str:
+    return "请转录这张课堂笔记照片。"
+
+
+def _notes_block(notes_md: Optional[str]) -> str:
+    """把课堂笔记照片转录文本拼成可注入的补充素材块。"""
+    notes_md = (notes_md or "").strip()
+    if not notes_md:
+        return ""
+    return (
+        "\n\n【课堂笔记照片（辅助素材，来自学员上传的笔记/板书照片）】\n"
+        f"{notes_md}\n"
+        "（以上为辅助素材：可用于补全讲授中一带而过、但笔记里记下的要点、板书公式、案例数据；"
+        "与逐字稿冲突时以逐字稿为准；不要把笔记里的内容当成老师的原话直接引用，更不要据此杜撰。）"
+    )
+
+
 # ---------------- Step 3：纪要主体 ----------------
 def minutes_system(pre_prompt: str, detail_level: str = "detailed") -> str:
     depth = (
@@ -143,11 +175,14 @@ def minutes_system(pre_prompt: str, detail_level: str = "detailed") -> str:
     )
 
 
-def minutes_user(transcript_md: str, chapters_md: Optional[str]) -> str:
+def minutes_user(transcript_md: str, chapters_md: Optional[str], notes_md: Optional[str] = None) -> str:
     parts = []
     if chapters_md:
         parts.append(f"【章节稿】\n{chapters_md}")
     parts.append(f"【课堂逐字稿】\n{transcript_md}")
+    block = _notes_block(notes_md)
+    if block:
+        parts.append(block.strip())
     return "\n\n".join(parts)
 
 

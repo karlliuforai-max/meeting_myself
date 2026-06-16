@@ -1,7 +1,9 @@
 """Provider 配置的持久化存储（运行时可增删改）。
 
 落盘到 data/providers.json，结构：
-    {"default_id": "<id>", "providers": [config, ...]}
+    {"default_id": "<id>",
+     "vision_id": "<id|空>", "vision_model": "<model|空>",  # 图片识别（笔记照片转录）专用，空=自动选支持视觉的供应商
+     "providers": [config, ...]}
 每个 config：
     {
       "id": str,              # 内部唯一标识（会话 step_models 用它引用）
@@ -81,7 +83,13 @@ def _seed_from_env() -> dict:
             "supports_vision": bool(s.openai_compat_vision),
         },
     ]
-    return {"default_id": s.default_provider or "deepseek", "providers": providers}
+    return {
+        "default_id": s.default_provider or "deepseek",
+        # 图片识别默认留空（自动选第一个支持视觉的已配置供应商）
+        "vision_id": "",
+        "vision_model": "",
+        "providers": providers,
+    }
 
 
 def _load_raw() -> dict:
@@ -187,3 +195,26 @@ def set_default(pid: str) -> bool:
         data["default_id"] = pid
         _save_raw(data)
         return True
+
+
+# ---------- 图片识别（笔记照片转录）专用模型 ----------
+def get_vision() -> dict:
+    """返回用户为图片识别手动指定的 (provider_id, model)；未设或已失效则为空（交由调用方自动兜底）。"""
+    data = _load_raw()
+    vid = data.get("vision_id") or ""
+    if vid and not any(c["id"] == vid for c in data["providers"]):
+        vid = ""  # 引用的供应商已被删除 → 视为未设
+    return {"id": vid, "model": (data.get("vision_model") or "") if vid else ""}
+
+
+def set_vision(pid: Optional[str], model: Optional[str] = None) -> dict:
+    """设置图片识别专用供应商/模型。pid 传空字符串/None = 清除（恢复自动）。"""
+    with _LOCK:
+        data = _load_raw()
+        pid = (pid or "").strip()
+        if pid and not any(c["id"] == pid for c in data["providers"]):
+            raise ValueError("provider 不存在")
+        data["vision_id"] = pid
+        data["vision_model"] = (model or "").strip() if pid else ""
+        _save_raw(data)
+        return get_vision()

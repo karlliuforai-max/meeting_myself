@@ -126,9 +126,35 @@ class SessionStore:
         p.write_bytes(data)
         return p
 
+    # 图片素材（课堂笔记照片等）支持的扩展名
+    IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+    _MEDIA_TYPES = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+    }
+
     def list_inputs(self, sid: str) -> List[str]:
         d = self._dir(sid) / "inputs"
-        return sorted(f.name for f in d.iterdir()) if d.exists() else []
+        # 只列普通文件，跳过派生缓存等子目录
+        return sorted(f.name for f in d.iterdir() if f.is_file()) if d.exists() else []
+
+    def list_image_inputs(self, sid: str) -> List[str]:
+        """列出图片类输入文件名（课堂笔记照片等辅助素材）。"""
+        return [f for f in self.list_inputs(sid) if Path(f).suffix.lower() in self.IMAGE_EXTS]
+
+    def input_path(self, sid: str, filename: str) -> Optional[Path]:
+        if "/" in filename or "\\" in filename or ".." in filename:
+            return None
+        p = self._dir(sid) / "inputs" / filename
+        return p if p.exists() and p.is_file() else None
+
+    def read_input_bytes(self, sid: str, filename: str) -> Optional[bytes]:
+        p = self.input_path(sid, filename)
+        return p.read_bytes() if p else None
+
+    @classmethod
+    def image_media_type(cls, filename: str) -> str:
+        return cls._MEDIA_TYPES.get(Path(filename).suffix.lower(), "image/png")
 
     def delete_input(self, sid: str, filename: str) -> bool:
         """删除指定输入文件。文件名走基础校验避免越界。"""
@@ -171,6 +197,33 @@ class SessionStore:
             if f.suffix.lower() in (".txt", ".md"):
                 parts.append(f.read_text(encoding="utf-8", errors="ignore"))
         return "\n\n".join(parts).strip()
+
+    # ---- 笔记照片转录缓存（按文件 mtime 失效，避免重复调用视觉模型）----
+    def _note_cache_path(self, sid: str, filename: str) -> Optional[Path]:
+        p = self.input_path(sid, filename)
+        if not p:
+            return None
+        mtime = int(p.stat().st_mtime)
+        safe = filename.replace("/", "_").replace("\\", "_")
+        return self._dir(sid) / "derived" / "notes" / f"{safe}.{mtime}.md"
+
+    def read_note_cache(self, sid: str, filename: str) -> Optional[str]:
+        """读取该图片的转录缓存；图片不存在或 mtime 已变（缓存失效）返回 None。"""
+        cp = self._note_cache_path(sid, filename)
+        if cp and cp.exists():
+            return cp.read_text(encoding="utf-8")
+        return None
+
+    def write_note_cache(self, sid: str, filename: str, text: str) -> None:
+        cp = self._note_cache_path(sid, filename)
+        if not cp:
+            return
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        # 清掉同一文件的旧 mtime 缓存，避免无限堆积
+        for old in cp.parent.glob(f"{cp.name.rsplit('.', 2)[0]}.*.md"):
+            if old != cp:
+                old.unlink(missing_ok=True)
+        cp.write_text(text, encoding="utf-8")
 
     # ---- 产出（artifacts）与版本 ----
     def read_artifact(self, sid: str, name: str) -> Optional[str]:

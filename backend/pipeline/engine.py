@@ -24,6 +24,7 @@ from providers import Message, ProviderError, build_provider, get_provider
 from providers import store as provider_store
 from storage import session_store
 
+from . import vision
 from .transcript import (
     clean_fallback,
     has_timestamps,
@@ -464,12 +465,46 @@ def _step_minutes(sid: str, meta, pre: str, detail_level: str, out_name: str) ->
     label = "精炼" if detail_level == "concise" else "详尽"
     step_key = "minutes_concise" if detail_level == "concise" else "minutes_detailed"
 
-    yield _evt("step", step=step_key, percent=10, message=f"综合知识、生成{label}版纪要…")
+    # 收集课堂笔记照片（辅助素材）：转录为文字注入纪要
+    notes_md = ""
+    n_images = len(session_store.list_image_inputs(sid))
+    if n_images:
+        yield _evt("step", step=step_key, percent=6,
+                   message=f"识别 {n_images} 张笔记照片…")
+        notes_md, ninfo = vision.collect_note_text(sid, pre)
+        for evt in _note_progress_events(step_key, ninfo):
+            yield evt
+
+    yield _evt("step", step=step_key, percent=15, message=f"综合知识、生成{label}版纪要…")
     prov, model = _resolve_provider(meta, step_key)
-    minutes_md = _make_minutes(prov, model, pre, detail_level, transcript_md, chapters_md or "")
+    minutes_md = _make_minutes(prov, model, pre, detail_level, transcript_md, chapters_md or "", notes_md)
     session_store.write_artifact(sid, out_name, minutes_md, note="生成")
     yield _evt("artifact", step=step_key, name=out_name)
     yield _evt("step", step=step_key, percent=100, message=f"{label}版纪要完成")
+
+
+def _note_progress_events(step_key: str, ninfo: dict) -> List[dict]:
+    """把笔记转录统计转成进度提示事件。"""
+    evts: List[dict] = []
+    if not ninfo.get("images"):
+        return evts
+    if not ninfo.get("vision"):
+        evts.append(_evt("step", step=step_key, percent=10,
+                          message=f"提示：检测到 {ninfo['images']} 张笔记照片，但未配置可用的图片识别模型，"
+                                  "本次未纳入。请在右上角「模型配置」面板设置「图片识别模型」后重试。"))
+        return evts
+    parts = []
+    if ninfo.get("transcribed"):
+        parts.append(f"新识别 {ninfo['transcribed']} 张")
+    if ninfo.get("cached"):
+        parts.append(f"复用缓存 {ninfo['cached']} 张")
+    if ninfo.get("failed"):
+        parts.append(f"{ninfo['failed']} 张识别失败")
+    if parts:
+        prov = f"（{ninfo.get('provider')}）" if ninfo.get("provider") else ""
+        evts.append(_evt("step", step=step_key, percent=12,
+                         message="笔记照片：" + "、".join(parts) + prov))
+    return evts
 
 
 def _step_graph(sid: str, meta, pre: str) -> Iterator[dict]:
@@ -566,14 +601,15 @@ def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str,
     return candidates
 
 
-def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str, chapters_md: str) -> str:
-    """整篇一次成稿（依赖现代模型长上下文）：把完整实录(+纲目)一次喂给模型，
+def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str,
+                  chapters_md: str, notes_md: str = "") -> str:
+    """整篇一次成稿（依赖现代模型长上下文）：把完整实录(+纲目+笔记照片转录)一次喂给模型，
     避免 map-reduce 丢上下文/丢跨段关联。超出所选模型上下文时由 provider 直接报错，
     用户改用大上下文模型即可（不再静默降级）。"""
     system = prompts.minutes_system(pre, detail_level)
     max_tokens = MINUTES_DETAILED_MAX_TOKENS if detail_level == "detailed" else MINUTES_CONCISE_MAX_TOKENS
     return _call(provider, model, system,
-                 prompts.minutes_user(transcript_md, chapters_md or None),
+                 prompts.minutes_user(transcript_md, chapters_md or None, notes_md or None),
                  temperature=0.4, max_tokens=max_tokens)
 
 

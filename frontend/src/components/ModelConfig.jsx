@@ -31,6 +31,7 @@ const BLANK = {
 export default function ModelConfig({ onClose, onChanged }) {
   const [providers, setProviders] = useState([]);
   const [defaultId, setDefaultId] = useState("");
+  const [vision, setVision] = useState({ id: "", model: "" }); // 图片识别专用模型
   const [form, setForm] = useState(BLANK);
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState(null); // {ok, text|error}
@@ -41,7 +42,33 @@ export default function ModelConfig({ onClose, onChanged }) {
     return api.providers().then((d) => {
       setProviders(d.providers);
       setDefaultId(d.default_id);
+      setVision(d.vision || { id: "", model: "" });
     });
+  }
+
+  async function changeVisionProvider(pid) {
+    let model = "";
+    if (pid) {
+      const p = providers.find((x) => x.name === pid);
+      model = p?.default_model || p?.models?.[0] || "";
+    }
+    try {
+      const r = await api.setVisionModel(pid, model);
+      setVision(r.vision);
+      notifyChanged();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function changeVisionModel(model) {
+    try {
+      const r = await api.setVisionModel(vision.id, model);
+      setVision(r.vision);
+      notifyChanged();
+    } catch (e) {
+      setErr(e.message);
+    }
   }
 
   useEffect(() => {
@@ -300,6 +327,39 @@ export default function ModelConfig({ onClose, onChanged }) {
               </button>
             </div>
           </section>
+        </div>
+
+        {/* 图片识别模型：课堂笔记照片转录专用（全局，与各产出模型独立） */}
+        <div className="mc-vision">
+          <div className="mc-vision-title">图片识别模型<small className="muted">（课堂笔记照片转录用）</small></div>
+          <div className="mc-vision-row">
+            <select
+              value={vision.id || ""}
+              onChange={(e) => changeVisionProvider(e.target.value)}
+            >
+              <option value="">自动（选已配置且支持视觉的供应商）</option>
+              {providers.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.label}{p.supports_vision ? "" : "（未标视觉）"}
+                </option>
+              ))}
+            </select>
+            {vision.id && (
+              <select
+                value={vision.model || ""}
+                onChange={(e) => changeVisionModel(e.target.value)}
+              >
+                {(providers.find((p) => p.name === vision.id)?.models || []).map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            )}
+          </div>
+          <div className="muted small">
+            {vision.id
+              ? "已手动指定；生成纪要时用它识别图片素材。"
+              : "未指定：自动选第一个「已配置且支持视觉」的供应商；都没有则跳过图片素材。"}
+          </div>
         </div>
       </div>
     </div>

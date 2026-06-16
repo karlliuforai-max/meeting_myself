@@ -12,9 +12,17 @@ from typing import List, Optional
 
 
 @dataclass
+class ImagePart:
+    """一张图片输入（base64）。供视觉模型识别课堂笔记照片等辅助素材。"""
+    media_type: str  # 如 "image/png" / "image/jpeg" / "image/webp"
+    data_b64: str    # 图片字节的 base64 编码（不含 data: 前缀）
+
+
+@dataclass
 class Message:
     role: str  # "system" | "user" | "assistant"
     content: str
+    images: List[ImagePart] = field(default_factory=list)  # 仅 user 消息可带图；空=纯文本（行为不变）
 
 
 @dataclass

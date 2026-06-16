@@ -1,15 +1,15 @@
 # 会议纪要生成平台
 
-**v0.5.4** · 多场景会议纪要生成平台（本地优先）。当前开放：**商学院课堂讲座**板块。
+**v0.6.0** · 多场景会议纪要生成平台（本地优先）。当前开放：**商学院课堂讲座**板块。
 
-- 方案与架构：[docs/开发文档_v0.5.4.md](docs/开发文档_v0.5.4.md)（最新版；历史版本保留在 docs/）
+- 方案与架构：[docs/开发文档_v0.6.0.md](docs/开发文档_v0.6.0.md)（最新版；历史版本保留在 docs/）
 - 变更记录：[docs/CHANGELOG.md](docs/CHANGELOG.md)
 - 沟通时间线：[docs/开发日志.md](docs/开发日志.md)
 - 需求背景：[docs/任务背景.md](docs/任务背景.md)
 
 ## 功能概览
 
-上传课堂转写稿（txt / pdf / 图片），一键生成五类产出：
+上传课堂转写稿（txt 主体）与课堂笔记照片（图片，辅助素材；由视觉模型转录后纳入撷要/笺注），一键生成五类产出：
 
 | 产出 | 说明 |
 |---|---|
@@ -57,7 +57,7 @@ npm run dev                 # 默认 http://localhost:5173
 
 ## 模型配置
 
-**日常配置走界面**：启动后点右上角 **⚙ 模型配置**，即可随时新增/编辑/删除供应商、填 url/apikey/模型、设默认。配置持久化在 `data/providers.json`（git 忽略，含密钥不外发）。
+**日常配置走界面**：启动后点右上角 **⚙ 模型配置**，即可随时新增/编辑/删除供应商、填 url/apikey/模型、设默认。面板底部可单独指定**图片识别模型**（课堂笔记照片转录用，留空=自动选支持视觉的供应商）。配置持久化在 `data/providers.json`（git 忽略，含密钥不外发）。
 
 `backend/.env` **仅用于首次初始化**：第一次启动且 `data/providers.json` 不存在时，从 .env 播种出 Claude / DeepSeek / OpenAI 兼容 / Anthropic 中转站四个供应商；之后所有改动以面板（providers.json）为准，改 .env 不再生效（除非删掉 providers.json 重新播种）。
 
@@ -78,7 +78,7 @@ backend/
   api/             路由层
   providers/       模型层：base/claude/openai_compat（调用基类）+ dynamic（按配置构建）+ store（持久化）+ registry
   modules/         板块（business_school：商学院讲座）
-  pipeline/        处理引擎（engine / runner / transcript）
+  pipeline/        处理引擎（engine / runner / transcript / vision 图片转录）
   storage/         会话存储（含产出版本管理）
 frontend/
   src/             Vite + React 前端

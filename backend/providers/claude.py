@@ -6,9 +6,26 @@ _default_headers()。同时支持官方端点与第三方中转站。
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from .base import BaseProvider, ChatResult, Message, ProviderError
+
+
+def _anthropic_content(m: Message) -> Union[str, list]:
+    """构造单条消息的 content：无图时用纯文本字符串（行为不变），
+    有图时用内容块数组（图片在前、文本在后，符合 Anthropic 视觉惯例）。"""
+    if not getattr(m, "images", None):
+        return m.content
+    blocks: list = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": img.media_type, "data": img.data_b64},
+        }
+        for img in m.images
+    ]
+    if m.content:
+        blocks.append({"type": "text", "text": m.content})
+    return blocks
 
 
 class _AnthropicBase(BaseProvider):
@@ -49,7 +66,7 @@ class _AnthropicBase(BaseProvider):
         # Anthropic：system 单列，其余进 messages
         system_parts = [m.content for m in messages if m.role == "system"]
         chat_msgs = [
-            {"role": m.role, "content": m.content}
+            {"role": m.role, "content": _anthropic_content(m)}
             for m in messages
             if m.role in ("user", "assistant")
         ]

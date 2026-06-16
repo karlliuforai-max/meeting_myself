@@ -3,6 +3,10 @@ import { api } from "../api";
 import OutputView from "../components/OutputView.jsx";
 import InlineEdit from "../components/InlineEdit.jsx";
 
+const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"];
+const isImageFile = (name) =>
+  IMAGE_EXTS.some((ext) => name.toLowerCase().endsWith(ext));
+
 /**
  * 会话工作台。结构：
  *   ① 输入素材
@@ -323,7 +327,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
       <section className="card">
         <h2>① 输入素材</h2>
         <p className="muted small">
-          转写文字稿（txt，主体）；辅助资料（pdf）；课堂手写笔记（图片）。
+          转写文字稿（txt，主体）；课堂笔记照片（图片，辅助素材，自动识别后纳入撷要/笺注）。
         </p>
         <div className="upload-row">
           <input
@@ -331,7 +335,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
             id="wb-file-input"
             type="file"
             multiple
-            accept=".txt,.md,.pdf,.png,.jpg,.jpeg"
+            accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.webp"
             onChange={onFiles}
             className="hidden-file"
           />
@@ -339,7 +343,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
             <span className="upload-ico">＋</span>
             <span>{uploading ? "上传中…" : "选择文件"}</span>
           </label>
-          <span className="muted small">支持 txt / md / pdf / png / jpg；可多选</span>
+          <span className="muted small">支持 txt / md / png / jpg / webp；可多选</span>
         </div>
         <div className="file-list">
           {hasInputs ? (
@@ -355,9 +359,10 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
                 ) : (
                   <span
                     className="file-name"
-                    title={f + "（双击可重命名）"}
+                    title={f + "（双击可重命名）" + (isImageFile(f) ? " · 课堂笔记照片，将由图片识别模型转录" : "")}
                     onDoubleClick={() => setEditingFile(f)}
                   >
+                    {isImageFile(f) && <span className="file-kind" title="图片素材">📷</span>}
                     {f}
                   </span>
                 )}

@@ -38,7 +38,25 @@ def modules() -> dict:
 # ---------- 模型 / Provider ----------
 @router.get("/providers")
 def providers() -> dict:
-    return {"providers": list_providers(), "default_id": provider_store.default_id()}
+    return {
+        "providers": list_providers(),
+        "default_id": provider_store.default_id(),
+        "vision": provider_store.get_vision(),  # 图片识别专用模型（空=自动）
+    }
+
+
+class VisionModelReq(BaseModel):
+    provider_id: str = ""   # 空 = 清除手动指定，恢复自动选支持视觉的供应商
+    model: str = ""
+
+
+@router.put("/vision-model")
+def set_vision_model(req: VisionModelReq) -> dict:
+    """设置图片识别（课堂笔记照片转录）专用供应商/模型。"""
+    try:
+        return {"vision": provider_store.set_vision(req.provider_id, req.model)}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/providers/{pid}")

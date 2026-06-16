@@ -30,6 +30,12 @@ export const api = {
     req(`/providers/${pid}/default`, { method: "PUT" }),
   testProvider: (body) =>
     req("/providers/test", { method: "POST", body: JSON.stringify(body) }),
+  // 设置图片识别（笔记照片转录）专用模型；provider_id 留空 = 恢复自动
+  setVisionModel: (provider_id, model) =>
+    req("/vision-model", {
+      method: "PUT",
+      body: JSON.stringify({ provider_id: provider_id || "", model: model || "" }),
+    }),
   listSessions: (module) =>
     req("/sessions" + (module ? `?module=${module}` : "")),
   createSession: (body) =>

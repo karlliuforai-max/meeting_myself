@@ -371,6 +371,11 @@ button.danger:hover {
   white-space: nowrap;
 }
 
+.file-kind {
+  margin-right: 5px;
+  font-size: 12px;
+}
+
 /* ---------- 素材文件 chips ---------- */
 .file-chips {
   display: flex;
@@ -1111,6 +1116,38 @@ input[type="file"] {
 }
 .mc-actions button:not(.primary):not(.danger):hover {
   border-color: var(--clay);
+}
+
+/* ---------- 图片识别模型选择（模态底部） ---------- */
+.mc-vision {
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--ivory-card);
+  border-radius: 0 0 12px 12px;
+}
+.mc-vision-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 8px;
+}
+.mc-vision-title small {
+  font-weight: 400;
+  margin-left: 4px;
+}
+.mc-vision-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.mc-vision-row select {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--ivory);
+  font-size: 13px;
+  color: var(--ink);
 }
 
 /* ---------- 产出版本切换器 ---------- */
