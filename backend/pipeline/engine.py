@@ -56,7 +56,7 @@ CORRECT_RETRIES = 3          # 单块纠错的尝试次数（模型返回空/报
 # 纲目：分段并行提取候选阶段，再按课堂长度汇编为 20-50 个最终阶段
 CHAPTERS_SEG_CHARS = 6000
 CHAPTERS_SEGMENT_MAX_TOKENS = 4000
-CHAPTERS_FINAL_MAX_TOKENS = 7000
+CHAPTERS_FINAL_MAX_TOKENS = 12000
 CHAPTERS_MIN_STAGES = 20
 CHAPTERS_MAX_STAGES = 50
 CHAPTERS_MINUTES_PER_STAGE = 6
@@ -158,6 +158,23 @@ def _renumber_stages(md: str) -> str:
 
 def _count_stages(md: str) -> int:
     return len(_STAGE_HEADING.findall(md or ""))
+
+
+_EMPTY_STAGE_HEADING = re.compile(
+    r"(?m)^#{1,6}\s*阶段\s*[0-9０-９一二三四五六七八九十]+\s*[：:]\s*$"
+)
+
+
+def _chapters_complete(md: str) -> bool:
+    """判断纲目是否像一个完整成稿。
+
+    目前最常见的截断形态是末尾只剩 `### 阶段20：` 这种空标题；这种结果
+    即便阶段数落在 20-50 硬边界内，也不能当成成功产出。
+    """
+    text = (md or "").strip()
+    if not text or _count_stages(text) == 0:
+        return False
+    return _EMPTY_STAGE_HEADING.search(text) is None
 
 
 def _target_chapter_stages(source: str, has_ts: bool) -> int:
@@ -579,7 +596,7 @@ def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str,
     )
     merged = _renumber_stages(merged)
     merged_count = _count_stages(merged)
-    if min_stages <= merged_count <= max_stages:
+    if _chapters_complete(merged) and min_stages <= merged_count <= max_stages:
         return merged
 
     repaired = _call(
@@ -592,13 +609,26 @@ def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str,
     )
     repaired = _renumber_stages(repaired)
     repaired_count = _count_stages(repaired)
-    if min_stages <= repaired_count <= max_stages:
+    if _chapters_complete(repaired) and min_stages <= repaired_count <= max_stages:
         return repaired
-    if CHAPTERS_MIN_STAGES <= repaired_count <= CHAPTERS_MAX_STAGES:
+
+    candidates_count = _count_stages(candidates)
+    if _chapters_complete(candidates) and min_stages <= candidates_count <= max_stages:
+        return candidates
+
+    # 宽容兜底只允许“偏多但完整”的结果；低于本堂课预算下界通常意味着输出被截断。
+    if _chapters_complete(repaired) and max_stages < repaired_count <= CHAPTERS_MAX_STAGES:
         return repaired
-    if CHAPTERS_MIN_STAGES <= merged_count <= CHAPTERS_MAX_STAGES:
+    if _chapters_complete(merged) and max_stages < merged_count <= CHAPTERS_MAX_STAGES:
         return merged
-    return candidates
+    if _chapters_complete(candidates) and max_stages < candidates_count <= CHAPTERS_MAX_STAGES:
+        return candidates
+
+    raise ProviderError(
+        f"纲目生成未达到完整性要求：目标约 {target} 个阶段，期望 {min_stages}-{max_stages} 个；"
+        f"汇编得到 {merged_count} 个，修复后 {repaired_count} 个，候选 {candidates_count} 个。"
+        "请重试或切换更大输出上限的模型。"
+    )
 
 
 def _make_minutes(provider, model, pre: str, detail_level: str, transcript_md: str,

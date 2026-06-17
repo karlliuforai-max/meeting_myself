@@ -16,6 +16,26 @@ async function req(path, options = {}) {
   return res.json();
 }
 
+async function download(path, filename) {
+  const res = await fetch(BASE + path);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch (_) {}
+    throw new Error(detail);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "download";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export const api = {
   health: () => req("/health"),
   modules: () => req("/modules"),
@@ -63,6 +83,18 @@ export const api = {
     }),
   getArtifact: (id, name) =>
     req(`/sessions/${id}/artifacts/${encodeURIComponent(name)}`),
+  downloadArtifact: (id, name) =>
+    download(`/sessions/${id}/artifacts/${encodeURIComponent(name)}/download`, name),
+  downloadArtifactVersion: (id, name, version) => {
+    const dot = name.lastIndexOf(".");
+    const filename = dot > 0 ? `${name.slice(0, dot)}_v${version}${name.slice(dot)}` : `${name}_v${version}`;
+    return download(
+      `/sessions/${id}/artifacts/${encodeURIComponent(name)}/versions/${version}/download`,
+      filename
+    );
+  },
+  downloadBundle: (id, title) =>
+    download(`/sessions/${id}/exports/bundle`, `${(title || "会议纪要").trim() || "会议纪要"}_产出.zip`),
   getArtifactVersion: (id, name, version) =>
     req(`/sessions/${id}/artifacts/${encodeURIComponent(name)}/versions/${version}`),
   restoreVersion: (id, name, version) =>

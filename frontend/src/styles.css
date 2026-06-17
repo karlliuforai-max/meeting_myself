@@ -426,6 +426,23 @@ button.primary.ghost:hover {
 .products-h {
   margin-top: 6px;
 }
+.products-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin: 0 0 14px;
+  flex-wrap: wrap;
+}
+.products-heading h2 {
+  margin: 0;
+}
+.products-export-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
 .products-h-body {
   display: flex;
   flex-direction: column;
@@ -607,6 +624,13 @@ button.primary.ghost:hover {
 }
 .ghost-btn:hover {
   background: var(--ivory-hover);
+}
+.ghost-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ghost-btn:disabled:hover {
+  background: var(--ivory);
 }
 .mermaid-canvas {
   width: 100%;

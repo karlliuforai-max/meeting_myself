@@ -20,11 +20,14 @@ from pipeline.engine import (  # noqa: E402
 from pipeline.transcript import transcript_duration_seconds  # noqa: E402
 
 
-def _outline(count: int) -> str:
-    return "\n\n".join(
-        f"### 阶段{i}：主题{i} ()\n第{i}阶段的核心内容。"
-        for i in range(1, count + 1)
-    )
+def _outline(count: int, empty_last: bool = False) -> str:
+    rows = []
+    for i in range(1, count + 1):
+        if empty_last and i == count:
+            rows.append(f"### 阶段{i}：")
+        else:
+            rows.append(f"### 阶段{i}：主题{i} ()\n第{i}阶段的核心内容。")
+    return "\n\n".join(rows)
 
 
 class FakeProvider:
@@ -47,6 +50,30 @@ class FakeProvider:
         else:
             count = int(re.search(r"恰好 (\d+) 个", user).group(1))
 
+        return SimpleNamespace(
+            text=_outline(count),
+            model=model or "fake",
+            provider="fake",
+            usage={},
+        )
+
+
+class TruncatedMergeProvider(FakeProvider):
+    def chat(self, messages, model=None, temperature=0.3, max_tokens=4096):
+        system = messages[0].content
+        user = messages[1].content
+        self.calls.append((system, user, max_tokens))
+
+        if "【候选纲目】" in user:
+            self.merge_calls += 1
+            return SimpleNamespace(
+                text=_outline(20, empty_last=True),
+                model=model or "fake",
+                provider="fake",
+                usage={},
+            )
+
+        count = int(re.search(r"恰好 (\d+) 个", user).group(1))
         return SimpleNamespace(
             text=_outline(count),
             model=model or "fake",
@@ -91,6 +118,16 @@ class ChapterBudgetTests(unittest.TestCase):
         self.assertEqual(_count_stages(result), 30)
         self.assertEqual(provider.merge_calls, 2)
         self.assertIn("上次汇编得到 60 个阶段", provider.calls[-1][1])
+
+    def test_make_chapters_rejects_truncated_merge_and_uses_candidates(self):
+        provider = TruncatedMergeProvider()
+        source = "课堂内容。" * 10_800  # 约 5.4 万字，目标 30 个阶段
+
+        result = _make_chapters(provider, "fake", "", "", source, has_ts=False)
+
+        self.assertEqual(_count_stages(result), 30)
+        self.assertNotIn("### 阶段20：\n", result)
+        self.assertEqual(provider.merge_calls, 2)
 
 
 if __name__ == "__main__":

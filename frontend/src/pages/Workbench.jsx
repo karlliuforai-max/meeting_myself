@@ -32,6 +32,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
   const [viewVersion, setViewVersion] = useState({}); // step.key → 0(当前) | 历史版本号
   const [viewContent, setViewContent] = useState({}); // step.key → 历史版本内容
   const [reviseText, setReviseText] = useState({}); // step.key → 修订意见输入
+  const [exportHint, setExportHint] = useState("");
 
   const fileRef = useRef(null);
   const esRefs = useRef({});
@@ -282,6 +283,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
 
   if (!session) return <div className="empty">加载项目…</div>;
   const hasInputs = session.inputs?.length > 0;
+  const hasArtifacts = (session.artifacts || []).length > 0;
   const activeDep = checkDeps(activeStep);
   const activeStatus = stepStatus[activeStep.key] || {};
   const activeContent = artifacts[activeStep.key];
@@ -300,6 +302,35 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
   const viewingHistory = activeViewVersion !== 0;
   const displayedContent = viewingHistory ? viewContent[activeStep.key] : activeContent;
   const latestVersionNo = activeVersions.length;
+
+  function flashExportHint(text) {
+    setExportHint(text);
+    setTimeout(() => setExportHint(""), 1800);
+  }
+
+  async function downloadActiveOutput() {
+    if (!activeContent) return;
+    try {
+      if (viewingHistory) {
+        await api.downloadArtifactVersion(sessionId, activeStep.output_name, activeViewVersion);
+        flashExportHint(`已开始下载「${activeStep.title}」v${activeViewVersion}`);
+      } else {
+        await api.downloadArtifact(sessionId, activeStep.output_name);
+        flashExportHint(`已开始下载「${activeStep.title}」`);
+      }
+    } catch (e) {
+      alert("导出失败：" + e.message);
+    }
+  }
+
+  async function downloadBundle() {
+    try {
+      await api.downloadBundle(sessionId, session.title);
+      flashExportHint("已开始打包下载");
+    } catch (e) {
+      alert("导出失败：" + e.message);
+    }
+  }
 
   return (
     <div className="workbench">
@@ -400,7 +431,20 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
 
       {/* ③ 产出区：横版 Tab + 下方面板 */}
       <section className="products-h">
-        <h2 style={{ margin: "0 0 14px" }}>③ 产出</h2>
+        <div className="products-heading">
+          <h2>③ 产出</h2>
+          <div className="products-export-actions">
+            {exportHint && <span className="muted small saved">{exportHint}</span>}
+            <button
+              className="ghost-btn"
+              onClick={downloadBundle}
+              disabled={!hasArtifacts}
+              title={hasArtifacts ? "下载本项目全部已生成产出" : "暂无可导出的产出"}
+            >
+              打包全部
+            </button>
+          </div>
+        </div>
         <div className="products-h-body">
           {/* 上：横向 Tab 条 */}
           <nav className="products-tabs">
@@ -470,6 +514,14 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
                     <option key={activeModelName} value={activeModelName}>{activeModelName}</option>
                   )}
                 </select>
+                <button
+                  className="ghost-btn"
+                  disabled={!activeContent}
+                  title={activeContent ? "下载当前面板显示的产出" : "尚未生成，无法下载"}
+                  onClick={downloadActiveOutput}
+                >
+                  {viewingHistory ? "下载此版本" : "下载当前"}
+                </button>
                 <button
                   className="primary"
                   disabled={!activeDep.ok || activeStatus.running}

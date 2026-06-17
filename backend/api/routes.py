@@ -5,11 +5,15 @@
 """
 from __future__ import annotations
 
+import io
 import json
+import re
 from typing import List, Optional
+from urllib.parse import quote
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from config import APP_VERSION
@@ -26,7 +30,7 @@ router = APIRouter(prefix="/api")
 @router.get("/health")
 def health() -> dict:
     # phase 随开发进度更新；version 取自根 VERSION（单一版本源）
-    return {"status": "ok", "service": "meeting-minutes", "phase": "P2", "version": APP_VERSION}
+    return {"status": "ok", "service": "meeting-minutes", "phase": "P3", "version": APP_VERSION}
 
 
 # ---------- 板块 ----------
@@ -337,15 +341,72 @@ def get_artifact(sid: str, name: str) -> dict:
                 break
     if content is None:
         raise HTTPException(404, "产出不存在（可能尚未生成）")
-    return {"name": name, "content": content, "versions": session_store.list_versions(sid, name)}
+    return {"name": name, "content": content, "versions": _version_entries_compat(sid, name)}
+
+
+@router.get("/sessions/{sid}/artifacts/{name}/download")
+def download_artifact(sid: str, name: str) -> Response:
+    """下载当前产出文件（含老会话文件名兼容）。"""
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    content = _read_artifact_compat(sid, name)
+    if content is None:
+        raise HTTPException(404, "产出不存在（可能尚未生成）")
+    return Response(
+        content.encode("utf-8"),
+        media_type=_artifact_media_type(name),
+        headers={"Content-Disposition": _attachment_header(name)},
+    )
+
+
+@router.get("/sessions/{sid}/exports/bundle")
+def export_bundle(sid: str) -> Response:
+    """打包下载当前会话所有已生成产出。只导出产物，不包含原始输入素材。"""
+    meta = session_store.get(sid)
+    if not meta:
+        raise HTTPException(404, "会话不存在")
+
+    names = available_artifacts(sid)
+    if not names:
+        raise HTTPException(404, "暂无可导出的产出")
+
+    buf = io.BytesIO()
+    with ZipFile(buf, "w", ZIP_DEFLATED) as zf:
+        for name in names:
+            content = _read_artifact_compat(sid, name)
+            if content is not None:
+                zf.writestr(name, content)
+    buf.seek(0)
+
+    filename = f"{_safe_filename(meta.title) or '会议纪要'}_产出.zip"
+    return Response(
+        buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": _attachment_header(filename)},
+    )
 
 
 @router.get("/sessions/{sid}/artifacts/{name}/versions/{version}")
 def get_artifact_version(sid: str, name: str, version: int) -> dict:
-    content = session_store.read_version(sid, name, version)
+    content = _read_version_compat(sid, name, version)
     if content is None:
         raise HTTPException(404, "该版本不存在")
     return {"name": name, "version": version, "content": content}
+
+
+@router.get("/sessions/{sid}/artifacts/{name}/versions/{version}/download")
+def download_artifact_version(sid: str, name: str, version: int) -> Response:
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    content = _read_version_compat(sid, name, version)
+    if content is None:
+        raise HTTPException(404, "该版本不存在")
+    filename = _version_filename(name, version)
+    return Response(
+        content.encode("utf-8"),
+        media_type=_artifact_media_type(filename),
+        headers={"Content-Disposition": _attachment_header(filename)},
+    )
 
 
 @router.post("/sessions/{sid}/artifacts/{name}/versions/{version}/restore")
@@ -353,7 +414,7 @@ def restore_artifact_version(sid: str, name: str, version: int) -> dict:
     """把某历史版本恢复为当前（写成一个新版本，不抹掉历史）。"""
     if not session_store.get(sid):
         raise HTTPException(404, "会话不存在")
-    content = session_store.read_version(sid, name, version)
+    content = _read_version_compat(sid, name, version)
     if content is None:
         raise HTTPException(404, "该版本不存在")
     new_version = session_store.write_artifact(sid, name, content, note=f"恢复自 v{version}")
@@ -361,6 +422,84 @@ def restore_artifact_version(sid: str, name: str, version: int) -> dict:
 
 
 # ---------- 助手 ----------
+def _read_artifact_compat(sid: str, name: str) -> Optional[str]:
+    """优先读规范化产出名；找不到时尝试老文件名。"""
+    from pipeline.engine import LEGACY_NAMES
+
+    content = session_store.read_artifact(sid, name)
+    if content is not None:
+        return content
+    for legacy in LEGACY_NAMES.get(name, []):
+        content = session_store.read_artifact(sid, legacy)
+        if content is not None:
+            return content
+    return None
+
+
+def _version_source_names(name: str) -> List[str]:
+    """返回该规范产出名对应的旧名版本目录 + 当前目录。
+
+    老会话在 v0.2 前后改过产出文件名，版本文件真实落在旧目录里；前端现在只按
+    新文件名查询，所以这里把旧目录合并成一条连续版本线。
+    """
+    from pipeline.engine import LEGACY_NAMES
+
+    names = list(LEGACY_NAMES.get(name, []))
+    names.append(name)
+    # 去重且保序，避免未来配置里出现重复别名。
+    return list(dict.fromkeys(names))
+
+
+def _version_entries_compat(sid: str, name: str) -> List[dict]:
+    entries: List[dict] = []
+    public_version = 1
+    for source_name in _version_source_names(name):
+        for item in session_store.list_versions(sid, source_name):
+            entries.append({
+                "version": public_version,
+                "note": item.get("note", ""),
+                "source_name": source_name,
+                "source_version": item.get("version"),
+            })
+            public_version += 1
+    return entries
+
+
+def _read_version_compat(sid: str, name: str, version: int) -> Optional[str]:
+    if version < 1:
+        return None
+    public_version = 1
+    for source_name in _version_source_names(name):
+        for item in session_store.list_versions(sid, source_name):
+            if public_version == version:
+                return session_store.read_version(sid, source_name, item["version"])
+            public_version += 1
+    return None
+
+
+def _artifact_media_type(name: str) -> str:
+    if name.lower().endswith(".md"):
+        return "text/markdown; charset=utf-8"
+    return "text/plain; charset=utf-8"
+
+
+def _attachment_header(filename: str) -> str:
+    # 同时给 ascii fallback 和 RFC 5987 filename*，保证中文文件名在主流浏览器中可用。
+    fallback = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._") or "download"
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def _safe_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\r\n]+', "_", (name or "").strip()).strip(" ._")
+
+
+def _version_filename(name: str, version: int) -> str:
+    dot = name.rfind(".")
+    if dot > 0:
+        return f"{name[:dot]}_v{version}{name[dot:]}"
+    return f"{name}_v{version}"
+
+
 def _session_public(meta) -> dict:
     # 实时扫描已存在的产出（含老文件名 → 新名 映射），不再依赖 meta.artifacts 落后状态
     artifacts = available_artifacts(meta.id)
