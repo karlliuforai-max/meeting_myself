@@ -19,7 +19,7 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -28,6 +28,31 @@ from config import settings
 
 def _now() -> float:
     return round(time.time(), 3)
+
+
+def _safe_name(filename: str) -> Optional[str]:
+    """把上传/操作的文件名净化为「纯文件名」，拒绝任何越界写入。
+
+    约束：无论客户端传 "a/b"、"..\\x"、"../x" 还是纯 ".."，都不能落到 inputs/ 之外。
+    统一把反斜杠视作分隔符后取 basename；结果为空或恰是 "."/".." 视为非法（返回 None）。
+    """
+    name = Path((filename or "").replace("\\", "/")).name.strip()
+    if not name or name in (".", ".."):
+        return None
+    return name
+
+
+def _decode_text(data: bytes) -> str:
+    """稳健解码文本输入：优先 utf-8（带 BOM）→ 退 gb18030（国内常见 GBK 系）→ 最后 utf-8 容错替换。
+
+    严格模式逐级尝试，避免把 GBK 文稿解成乱码；都不成时用 replace 保证不抛异常。
+    """
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -96,7 +121,14 @@ class SessionStore:
         p = self._meta_path(sid)
         if not p.exists():
             return None
-        return SessionMeta(**json.loads(p.read_text(encoding="utf-8")))
+        # 前向兼容：未来版本给 meta.json 增字段时，老代码读到未知键应忽略而非崩溃；
+        # JSON 损坏或缺必填字段一律返回 None（list 天然跳过），避免整站因单个坏会话报错。
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            known = {f.name for f in fields(SessionMeta)}
+            return SessionMeta(**{k: v for k, v in data.items() if k in known})
+        except Exception:  # noqa: BLE001
+            return None
 
     def update(self, meta: SessionMeta) -> SessionMeta:
         self._write_meta(meta)
@@ -122,7 +154,11 @@ class SessionStore:
 
     # ---- 输入文件 ----
     def save_input(self, sid: str, filename: str, data: bytes) -> Path:
-        p = self._dir(sid) / "inputs" / filename
+        # 落盘前净化文件名，杜绝 "../" 之类路径穿越写到 inputs/ 之外。
+        safe = _safe_name(filename)
+        if not safe:
+            raise ValueError("文件名非法")
+        p = self._dir(sid) / "inputs" / safe
         p.write_bytes(data)
         return p
 
@@ -157,8 +193,8 @@ class SessionStore:
         return cls._MEDIA_TYPES.get(Path(filename).suffix.lower(), "image/png")
 
     def delete_input(self, sid: str, filename: str) -> bool:
-        """删除指定输入文件。文件名走基础校验避免越界。"""
-        if "/" in filename or ".." in filename:
+        """删除指定输入文件。文件名走基础校验避免越界（含反斜杠，与 input_path 一致）。"""
+        if "/" in filename or "\\" in filename or ".." in filename:
             return False
         p = self._dir(sid) / "inputs" / filename
         if p.exists() and p.is_file():
@@ -171,7 +207,7 @@ class SessionStore:
         保留原扩展名（前端只编辑主名），避免误改类型。
         """
         for s in (old, new):
-            if "/" in s or ".." in s or not s.strip():
+            if "/" in s or "\\" in s or ".." in s or not s.strip():
                 return None
         d = self._dir(sid) / "inputs"
         src = d / old
@@ -187,16 +223,20 @@ class SessionStore:
         src.rename(dst)
         return dst.name
 
-    def read_text_inputs(self, sid: str) -> str:
-        """读取并拼接所有文本类输入（txt/md）。pdf/图片在 P3 处理。"""
+    def read_text_input_parts(self, sid: str) -> List[str]:
+        """按文件名排序返回逐个文本输入（txt/md）的文本，便于对每个文件单独估时长等。"""
         d = self._dir(sid) / "inputs"
         if not d.exists():
-            return ""
+            return []
         parts: List[str] = []
         for f in sorted(d.iterdir()):
-            if f.suffix.lower() in (".txt", ".md"):
-                parts.append(f.read_text(encoding="utf-8", errors="ignore"))
-        return "\n\n".join(parts).strip()
+            if f.is_file() and f.suffix.lower() in (".txt", ".md"):
+                parts.append(_decode_text(f.read_bytes()))
+        return parts
+
+    def read_text_inputs(self, sid: str) -> str:
+        """读取并拼接所有文本类输入（txt/md）。pdf/图片在 P3 处理。"""
+        return "\n\n".join(self.read_text_input_parts(sid)).strip()
 
     # ---- 笔记照片转录缓存（按文件 mtime 失效，避免重复调用视觉模型）----
     def _note_cache_path(self, sid: str, filename: str) -> Optional[Path]:
@@ -226,6 +266,10 @@ class SessionStore:
         cp.write_text(text, encoding="utf-8")
 
     # ---- 产出（artifacts）与版本 ----
+    def artifact_exists(self, sid: str, name: str) -> bool:
+        """只判存在、不读内容（供大量存在性检查提速，如 available_artifacts）。"""
+        return (self._dir(sid) / "artifacts" / name).exists()
+
     def read_artifact(self, sid: str, name: str) -> Optional[str]:
         p = self._dir(sid) / "artifacts" / name
         return p.read_text(encoding="utf-8") if p.exists() else None

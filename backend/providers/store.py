@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import List, Optional
@@ -32,7 +34,8 @@ from config import settings
 
 _LOCK = threading.RLock()
 
-_FIELDS = ("label", "kind", "base_url", "api_key", "models", "default_model", "supports_vision")
+_FIELDS = ("label", "kind", "base_url", "api_key", "models", "default_model",
+           "supports_vision", "max_output_tokens")
 
 
 def _path() -> Path:
@@ -100,14 +103,25 @@ def _load_raw() -> dict:
         return data
     try:
         return json.loads(p.read_text("utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as e:
+        # 解析失败不能静默覆盖用户配置：先把坏文件改名保留现场，再播种。
+        try:
+            corrupt = p.with_name(f"{p.name}.corrupt-{int(time.time())}")
+            os.replace(p, corrupt)
+            print(f"[providers.store] providers.json 解析失败（{e}），已备份为 {corrupt.name} 并重新播种默认配置。")
+        except OSError:
+            print(f"[providers.store] providers.json 解析失败（{e}），且无法备份原文件，将重新播种默认配置。")
         data = _seed_from_env()
         _save_raw(data)
         return data
 
 
 def _save_raw(data: dict) -> None:
-    _path().write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    # 原子写：先写临时文件再 rename，避免写到一半崩溃留下半截 JSON。
+    p = _path()
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    os.replace(tmp, p)
 
 
 def _normalize(cfg: dict) -> dict:
@@ -126,6 +140,11 @@ def _normalize(cfg: dict) -> dict:
     if out["default_model"] and out["default_model"] not in out["models"]:
         out["models"].insert(0, out["default_model"])
     out["supports_vision"] = bool(out.get("supports_vision"))
+    # 输出上限：归一为 int≥0（非法/缺省=0=不限制）
+    try:
+        out["max_output_tokens"] = max(0, int(out.get("max_output_tokens") or 0))
+    except (TypeError, ValueError):
+        out["max_output_tokens"] = 0
     return out
 
 

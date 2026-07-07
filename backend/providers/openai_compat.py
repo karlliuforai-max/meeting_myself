@@ -6,9 +6,9 @@ chat 调用逻辑（_OpenAICompatBase）。子类提供 _api_key() 与 base_url�
 """
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
-from .base import BaseProvider, ChatResult, Message, ProviderError
+from .base import PROVIDER_TIMEOUT, BaseProvider, ChatResult, Message, ProviderError
 
 
 def _openai_content(m: Message) -> Union[str, list]:
@@ -40,27 +40,51 @@ class _OpenAICompatBase(BaseProvider):
     def is_configured(self) -> bool:
         return bool(self._api_key() and self.base_url)
 
+    def _client(self):
+        """惰性创建并缓存 OpenAI client（SDK 线程安全）：engine 每步 resolve 一次
+        provider，多个 chunk 复用同一实例，省去反复建连接的开销。"""
+        cached = getattr(self, "_client_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            from openai import OpenAI
+        except ImportError as e:  # pragma: no cover
+            raise ProviderError("未安装 openai SDK：pip install openai") from e
+        client = OpenAI(api_key=self._api_key(), base_url=self.base_url, timeout=PROVIDER_TIMEOUT)
+        self._client_cache = client
+        return client
+
+    def _cap_tokens(self, max_tokens: int) -> int:
+        # 供应商声明了输出上限（max_output_tokens>0）时收敛请求值，避免超模型能力被中转站拒。
+        cap = getattr(self, "max_output_tokens", 0) or 0
+        return min(max_tokens, cap) if cap > 0 else max_tokens
+
     def chat(
         self,
         messages: List[Message],
         model: Optional[str] = None,
         temperature: float = 0.3,
         max_tokens: int = 4096,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> ChatResult:
         if not self.is_configured():
             raise ProviderError(f"{self.name} 未配置（缺 API key 或 base_url）。")
-        try:
-            from openai import OpenAI
-        except ImportError as e:  # pragma: no cover
-            raise ProviderError("未安装 openai SDK：pip install openai") from e
-
-        client = OpenAI(api_key=self._api_key(), base_url=self.base_url)
+        client = self._client()
         # 优先用显式传入的模型，否则用本 provider 自己的默认模型
         model = model or self.default_model
+        max_tokens = self._cap_tokens(max_tokens)
+        payload = [{"role": m.role, "content": _openai_content(m)} for m in messages]
+
+        if on_delta is not None:
+            streamed = self._chat_stream(client, model, payload, temperature, max_tokens, on_delta)
+            if streamed is not None:
+                return streamed
+            # 首个 delta 之前就失败（部分中转站不支持 stream）→ 降级非流式重试一次。
+
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": m.role, "content": _openai_content(m)} for m in messages],
+                messages=payload,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
@@ -68,10 +92,56 @@ class _OpenAICompatBase(BaseProvider):
             raise ProviderError(f"{self.name} 调用失败：{e}") from e
 
         text = resp.choices[0].message.content or ""
-        usage = {}
-        if getattr(resp, "usage", None):
-            usage = {
-                "input_tokens": resp.usage.prompt_tokens,
-                "output_tokens": resp.usage.completion_tokens,
-            }
-        return ChatResult(text=text, model=model, provider=self.name, usage=usage)
+        finish = _normalize_finish(getattr(resp.choices[0], "finish_reason", None))
+        usage = _usage_of(getattr(resp, "usage", None))
+        return ChatResult(text=text, model=model, provider=self.name, usage=usage, finish_reason=finish)
+
+    def _chat_stream(self, client, model, payload, temperature, max_tokens, on_delta):
+        """流式路径。首个 delta 到达前若抛错，返回 None 让调用方降级；否则返回 ChatResult。"""
+        chunks: List[str] = []
+        finish = ""
+        usage: dict = {}
+        got_first = False
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=payload,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            for event in stream:
+                if getattr(event, "usage", None):
+                    usage = _usage_of(event.usage)
+                for choice in getattr(event, "choices", None) or []:
+                    delta = getattr(choice, "delta", None)
+                    piece = getattr(delta, "content", None) if delta else None
+                    if piece:
+                        chunks.append(piece)
+                        got_first = True
+                        on_delta(piece)
+                    fr = getattr(choice, "finish_reason", None)
+                    if fr:
+                        finish = _normalize_finish(fr)
+        except Exception as e:  # noqa: BLE001
+            if got_first:  # 已经流出内容 → 真错误，不再降级
+                raise ProviderError(f"{self.name} 调用失败：{e}") from e
+            return None
+        return ChatResult(
+            text="".join(chunks), model=model, provider=self.name,
+            usage=usage, finish_reason=finish or "stop",
+        )
+
+
+def _normalize_finish(reason: Optional[str]) -> str:
+    return "length" if reason == "length" else "stop"
+
+
+def _usage_of(usage) -> dict:
+    if not usage:
+        return {}
+    return {
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+    }

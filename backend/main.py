@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -13,8 +15,24 @@ from fastapi.staticfiles import StaticFiles
 
 from api.routes import router
 from config import APP_VERSION
+from pipeline import runner
 
-app = FastAPI(title="会议纪要生成平台", version=APP_VERSION)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时清理僵尸任务：上次进程被 kill/重启时正在跑的步骤，补一条中断 error，
+    # 否则前端会永远卡在「进行中」。用 lifespan 而非已废弃的 on_event。
+    # 扫描是磁盘密集型（全部会话 × 全部步骤），放线程池执行，不阻塞事件循环起服务。
+    try:
+        n = await asyncio.to_thread(runner.mark_interrupted_runs)
+        if n:
+            print(f"[startup] 标记 {n} 个因重启中断的生成任务为失败。")
+    except Exception as e:  # noqa: BLE001
+        print(f"[startup] 清理僵尸任务失败：{e}")
+    yield
+
+
+app = FastAPI(title="会议纪要生成平台", version=APP_VERSION, lifespan=lifespan)
 
 # 开发态跨域：允许本地前端访问
 app.add_middleware(

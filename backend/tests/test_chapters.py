@@ -20,6 +20,16 @@ from pipeline.engine import (  # noqa: E402
 from pipeline.transcript import transcript_duration_seconds  # noqa: E402
 
 
+def _run_chapters(*args, **kwargs) -> str:
+    """_make_chapters 现为生成器（merge/repair 流式发进度）：驱动到末尾取 return 的文本。"""
+    gen = _make_chapters(*args, **kwargs)
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
 def _outline(count: int, empty_last: bool = False) -> str:
     rows = []
     for i in range(1, count + 1):
@@ -36,7 +46,7 @@ class FakeProvider:
         self.merge_calls = 0
         self.calls = []
 
-    def chat(self, messages, model=None, temperature=0.3, max_tokens=4096):
+    def chat(self, messages, model=None, temperature=0.3, max_tokens=4096, on_delta=None):
         system = messages[0].content
         user = messages[1].content
         self.calls.append((system, user, max_tokens))
@@ -59,7 +69,7 @@ class FakeProvider:
 
 
 class TruncatedMergeProvider(FakeProvider):
-    def chat(self, messages, model=None, temperature=0.3, max_tokens=4096):
+    def chat(self, messages, model=None, temperature=0.3, max_tokens=4096, on_delta=None):
         system = messages[0].content
         user = messages[1].content
         self.calls.append((system, user, max_tokens))
@@ -90,7 +100,8 @@ class ChapterBudgetTests(unittest.TestCase):
 
     def test_character_proxy_matches_long_class_scale(self):
         self.assertEqual(_target_chapter_stages("中" * 63_000, has_ts=False), 35)
-        self.assertEqual(_target_chapter_stages("短课", has_ts=False), 20)
+        # 短课不再被硬抬到 20：绝对下限降到 4（S10）
+        self.assertEqual(_target_chapter_stages("短课", has_ts=False), 4)
         self.assertEqual(_target_chapter_stages("中" * 200_000, has_ts=False), 50)
 
     def test_segment_budgets_sum_to_target(self):
@@ -101,19 +112,19 @@ class ChapterBudgetTests(unittest.TestCase):
 
     def test_make_chapters_finishes_near_dynamic_target(self):
         provider = FakeProvider()
-        source = "课堂内容。" * 7_000  # 约 3.5 万字，目标 20 个阶段
+        source = "课堂内容。" * 7_000  # 约 3.5 万字，35000/1800 → 目标 19 个阶段（下限已降到 4）
 
-        result = _make_chapters(provider, "fake", "", "", source, has_ts=False)
+        result = _run_chapters(provider, "fake", "", "", source, has_ts=False)
 
-        self.assertEqual(_count_stages(result), 20)
+        self.assertEqual(_count_stages(result), 19)
         self.assertEqual(provider.merge_calls, 1)
-        self.assertIn("20 个阶段", provider.calls[0][0])
+        self.assertIn("19 个阶段", provider.calls[0][0])
 
     def test_make_chapters_retries_out_of_range_merge(self):
         provider = FakeProvider(invalid_first_merge=True)
         source = "课堂内容。" * 10_800  # 约 5.4 万字，目标 30 个阶段
 
-        result = _make_chapters(provider, "fake", "", "", source, has_ts=False)
+        result = _run_chapters(provider, "fake", "", "", source, has_ts=False)
 
         self.assertEqual(_count_stages(result), 30)
         self.assertEqual(provider.merge_calls, 2)
@@ -123,7 +134,7 @@ class ChapterBudgetTests(unittest.TestCase):
         provider = TruncatedMergeProvider()
         source = "课堂内容。" * 10_800  # 约 5.4 万字，目标 30 个阶段
 
-        result = _make_chapters(provider, "fake", "", "", source, has_ts=False)
+        result = _run_chapters(provider, "fake", "", "", source, has_ts=False)
 
         self.assertEqual(_count_stages(result), 30)
         self.assertNotIn("### 阶段20：\n", result)

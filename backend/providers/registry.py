@@ -38,6 +38,7 @@ def list_providers() -> List[dict]:
                 "configured": p.is_configured(),
                 "supports_vision": p.supports_vision,
                 "default_model": p.default_model,
+                "max_output_tokens": int(cfg.get("max_output_tokens") or 0),
                 "models": p.list_models(),
                 "is_default": cfg["id"] == did,
             }

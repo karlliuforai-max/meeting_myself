@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import mermaid from "mermaid";
 
 // 全局 Mermaid 主题：Anthropic 暖米白底 + 珊瑚色点缀，节点圆角，连线柔和
@@ -7,7 +8,7 @@ import mermaid from "mermaid";
 // 反之 true 会把文字塞进 <foreignObject> 里的 HTML，浏览器在 transform: scale 下会光栅化模糊。
 mermaid.initialize({
   startOnLoad: false,
-  securityLevel: "loose",
+  securityLevel: "strict",
   theme: "base",
   themeVariables: {
     fontFamily:
@@ -46,7 +47,9 @@ export default function OutputView({ name, content }) {
 }
 
 function MarkdownView({ md }) {
-  const html = marked.parse(md, { breaks: true });
+  // 转写稿可能混入 HTML，模型也可能把它带进产出。注入前统一用 DOMPurify 净化，
+  // 避免 <script>/onerror 之类内容在 dangerouslySetInnerHTML 中执行。
+  const html = DOMPurify.sanitize(marked.parse(md, { breaks: true }));
   return (
     <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />
   );

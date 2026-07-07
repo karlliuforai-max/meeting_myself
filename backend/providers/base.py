@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 @dataclass
@@ -31,16 +31,24 @@ class ChatResult:
     model: str
     provider: str
     usage: dict = field(default_factory=dict)
+    # 结束原因，规范化为 "stop"|"length"|""：用于上层判定输出是否因 max_tokens 被截断。
+    finish_reason: str = ""
 
 
 class ProviderError(RuntimeError):
     """Provider 调用失败（缺 key、网络、API 报错等）。"""
 
 
+# 单次模型调用的网络超时（秒）：中转站偶发挂起时避免线程被无限占用。
+PROVIDER_TIMEOUT = 180
+
+
 class BaseProvider(abc.ABC):
     name: str = "base"
     supports_vision: bool = False
     default_model: str = ""
+    # 该供应商的输出 token 硬上限（0=不限制）：>0 时对每次 max_tokens 取 min，避免超模型能力。
+    max_output_tokens: int = 0
 
     @abc.abstractmethod
     def is_configured(self) -> bool:
@@ -53,8 +61,12 @@ class BaseProvider(abc.ABC):
         model: Optional[str] = None,
         temperature: float = 0.3,
         max_tokens: int = 4096,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> ChatResult:
-        """发起一次对话补全，返回文本结果。"""
+        """发起一次对话补全，返回文本结果。
+
+        on_delta 非空时走 SDK 流式接口，每收到一段增量文本就回调（用于实时进度）；
+        为空时保持原有非流式行为。"""
 
     def list_models(self) -> List[str]:
         """该 provider 推荐/可选的模型列表（用于前端下拉）。"""

@@ -36,9 +36,23 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
 
   const fileRef = useRef(null);
   const esRefs = useRef({});
+  const esErrRefs = useRef({}); // step.key → 连续 onerror 次数（收到任何 message 归零）
 
-  const stepModels = session?.step_models || {};
+  // 每步「最终生效」的 provider/model：后端已完成默认解析，见 session.resolved_step_models。
+  // resolved 的 provider 字段是 provider id（等于 providers 列表里的 name 字段）。
+  const resolvedModels = session?.resolved_step_models || {};
+  const legacyModels = session?.step_models || {}; // 老后端无 resolved 时的极简降级
   const activeStep = module.steps.find((s) => s.key === activeKey) || module.steps[0];
+
+  // 某步骤当前生效的 { provider, model }。主路径走后端 resolved；缺失时退回用户覆盖值。
+  function stepModelFor(step) {
+    const r = resolvedModels[step?.key];
+    if (r && (r.provider || r.model)) {
+      return { provider: r.provider || "", model: r.model || "" };
+    }
+    const l = legacyModels[step?.key] || {};
+    return { provider: l.provider || "", model: l.model || "" };
+  }
 
   function load() {
     api.getSession(sessionId).then((s) => {
@@ -84,9 +98,13 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  // 模型配置面板改动后，重新拉取 provider 列表（不打断进行中的生成）
+  // 模型配置面板改动后，重新拉取 provider 列表与会话（不打断进行中的生成）：
+  // 供应商配置变化会影响每步「生效模型」的后端解析结果（resolved_step_models）。
   useEffect(() => {
-    if (providersVersion > 0) api.providers().then((d) => setProviders(d.providers));
+    if (providersVersion > 0) {
+      api.providers().then((d) => setProviders(d.providers));
+      api.getSession(sessionId).then(setSession);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providersVersion]);
 
@@ -155,8 +173,10 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     if (esRefs.current[stepKey]) return; // 已订阅
     const es = api.stepStream(sessionId, stepKey);
     esRefs.current[stepKey] = es;
+    esErrRefs.current[stepKey] = 0;
     setStatus(stepKey, { running: true, err: "" });
     es.onmessage = (e) => {
+      esErrRefs.current[stepKey] = 0; // 收到任何消息即视为连接健康
       let evt;
       try { evt = JSON.parse(e.data); } catch { return; }
       if (evt.type === "ping") return;
@@ -181,11 +201,24 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
         finishStream(stepKey);
       }
     };
+    // 断线兜底：EventSource 在服务不可达时会无限自动重连，UI 会永远卡在「生成中…」。
+    // 连续 ≥5 次 onerror（其间没有任何 message）判定为连接中断，主动收摊。
+    es.onerror = () => {
+      esErrRefs.current[stepKey] = (esErrRefs.current[stepKey] || 0) + 1;
+      if (esErrRefs.current[stepKey] >= 5) {
+        finishStream(stepKey);
+        setStatus(stepKey, {
+          running: false,
+          err: "与服务器的连接中断，请刷新页面或重新生成。",
+        });
+      }
+    };
   }
 
   function finishStream(stepKey) {
     esRefs.current[stepKey]?.close();
     delete esRefs.current[stepKey];
+    delete esErrRefs.current[stepKey];
   }
 
   async function generate(stepKey) {
@@ -242,10 +275,9 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
 
   async function changeStepModel(stepKey, provider, model) {
     await api.setStepModel(sessionId, { step: stepKey, provider, model });
-    setSession((s) => ({
-      ...s,
-      step_models: { ...(s.step_models || {}), [stepKey]: { provider, model } },
-    }));
+    // 重新拉取会话，拿后端最新的 resolved_step_models（不再本地手工拼 step_models）。
+    const s = await api.getSession(sessionId);
+    setSession(s);
   }
 
   function checkDeps(step) {
@@ -268,34 +300,16 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     return { ok: true, hint: "" };
   }
 
-  // 该步骤未被用户覆盖时的默认 provider/model：按 step.default_model 在已配置供应商里匹配
-  // （全局默认 provider 优先），否则回退全局默认。与后端 engine._step_default 保持一致。
-  function stepDefault(step) {
-    const pref = step?.default_model || "";
-    const dp = providers.find((p) => p.is_default);
-    if (pref) {
-      if (dp && dp.configured && (dp.models || []).includes(pref)) return { provider: dp.name, model: pref };
-      const hit = providers.find((p) => p.configured && (p.models || []).includes(pref));
-      if (hit) return { provider: hit.name, model: pref };
-    }
-    return { provider: dp?.name || "", model: dp?.default_model || "" };
-  }
-
   if (!session) return <div className="empty">加载项目…</div>;
   const hasInputs = session.inputs?.length > 0;
   const hasArtifacts = (session.artifacts || []).length > 0;
   const activeDep = checkDeps(activeStep);
   const activeStatus = stepStatus[activeStep.key] || {};
   const activeContent = artifacts[activeStep.key];
-  const activeModel = stepModels[activeStep.key] || {};
-  const activeDefault = stepDefault(activeStep);
-  const activeProviderName = activeModel.provider || activeDefault.provider || "";
+  const activeCurrent = stepModelFor(activeStep);
+  const activeProviderName = activeCurrent.provider || "";
   const activeProvider = providers.find((p) => p.name === activeProviderName);
-  const activeModelName =
-    activeModel.model ||
-    (activeProviderName === activeDefault.provider ? activeDefault.model : "") ||
-    activeProvider?.default_model ||
-    "";
+  const activeModelName = activeCurrent.model || activeProvider?.default_model || "";
   // 版本：0 = 当前最新（artifacts），否则查看某历史版本（只读）
   const activeVersions = versions[activeStep.key] || [];
   const activeViewVersion = viewVersion[activeStep.key] || 0;
@@ -366,7 +380,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
             id="wb-file-input"
             type="file"
             multiple
-            accept=".txt,.md,.pdf,.png,.jpg,.jpeg,.webp"
+            accept=".txt,.md,.png,.jpg,.jpeg,.webp,.gif,.bmp"
             onChange={onFiles}
             className="hidden-file"
           />
@@ -374,7 +388,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
             <span className="upload-ico">＋</span>
             <span>{uploading ? "上传中…" : "选择文件"}</span>
           </label>
-          <span className="muted small">支持 txt / md / png / jpg / webp；可多选</span>
+          <span className="muted small">支持 txt / md 与常见图片（png / jpg / webp / gif / bmp）；可多选</span>
         </div>
         <div className="file-list">
           {hasInputs ? (
@@ -452,10 +466,9 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
               const dep = checkDeps(step);
               const has = !!artifacts[step.key];
               const st = stepStatus[step.key] || {};
-              const sm = stepModels[step.key];
               const subText = st.running
                 ? `${st.percent || 0}% · 生成中`
-                : sm?.model || stepDefault(step).model || "—";
+                : stepModelFor(step).model || "—";
               return (
                 <button
                   key={step.key}

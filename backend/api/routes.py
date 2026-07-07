@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import queue
 import re
+import time
 from typing import List, Optional
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -18,7 +21,7 @@ from pydantic import BaseModel
 
 from config import APP_VERSION
 from modules import get_module, list_modules
-from pipeline import available_artifacts, run_stream, runner
+from pipeline import STEP_KEYS, available_artifacts, resolve_step_models, runner
 from providers import Message, ProviderError, build_provider, get_provider, list_providers
 from providers import store as provider_store
 from storage import session_store
@@ -63,13 +66,31 @@ def set_vision_model(req: VisionModelReq) -> dict:
         raise HTTPException(400, str(e))
 
 
+def _mask_key(key: str) -> str:
+    """脱敏展示 API key：长度>10 显示 前4…后4，否则有 key 显示「已设置」，无 key 为空。"""
+    key = key or ""
+    if len(key) > 10:
+        return f"{key[:4]}…{key[-4:]}"
+    return "已设置" if key else ""
+
+
 @router.get("/providers/{pid}")
 def get_provider_detail(pid: str) -> dict:
-    """取单个 provider 完整配置（含 api_key，供编辑表单回填）。"""
+    """取单个 provider 配置供编辑表单回填。
+
+    安全：api_key 恒为空字符串，绝不回传明文；另给脱敏串与 has_key 布尔。
+    编辑保存时不重敲 key（patch 不带 api_key）即保留原 key（update 走 exclude_unset）。
+    """
     cfg = provider_store.get_config(pid)
     if not cfg:
         raise HTTPException(404, "provider 配置不存在")
-    return cfg
+    key = cfg.get("api_key") or ""
+    out = dict(cfg)
+    out["api_key"] = ""
+    out["api_key_masked"] = _mask_key(key)
+    out["has_key"] = bool(key)
+    out["max_output_tokens"] = int(cfg.get("max_output_tokens") or 0)  # 老配置缺该字段时补 0
+    return out
 
 
 class ProviderConfigReq(BaseModel):
@@ -80,6 +101,7 @@ class ProviderConfigReq(BaseModel):
     models: List[str] = []
     default_model: str = ""
     supports_vision: bool = False
+    max_output_tokens: Optional[int] = None  # 输出上限（0/空=不限制）
 
 
 @router.post("/providers")
@@ -95,6 +117,7 @@ class ProviderPatchReq(BaseModel):
     models: Optional[List[str]] = None
     default_model: Optional[str] = None
     supports_vision: Optional[bool] = None
+    max_output_tokens: Optional[int] = None
 
 
 @router.put("/providers/{pid}")
@@ -135,6 +158,11 @@ def provider_test(req: ProviderTestReq) -> dict:
         if req.config is not None:
             draft = req.config.model_dump()
             draft["id"] = "__draft__"
+            # 「编辑已有供应商但没重敲 key」：草稿 key 为空且指明了 provider，则借用已存 key 测试。
+            if not (draft.get("api_key") or "").strip() and req.provider:
+                existing = provider_store.get_config(req.provider)
+                if existing and existing.get("api_key"):
+                    draft["api_key"] = existing["api_key"]
             p = build_provider(draft)
         else:
             p = get_provider(req.provider)
@@ -174,7 +202,7 @@ def get_session(sid: str) -> dict:
     meta = session_store.get(sid)
     if not meta:
         raise HTTPException(404, "会话不存在")
-    data = _session_public(meta)
+    data = _session_public(meta, include_resolved=True)
     data["inputs"] = session_store.list_inputs(sid)
     return data
 
@@ -213,8 +241,11 @@ async def upload_inputs(sid: str, files: List[UploadFile] = File(...)) -> dict:
     saved = []
     for f in files:
         data = await f.read()
-        session_store.save_input(sid, f.filename, data)
-        saved.append(f.filename)
+        try:
+            p = session_store.save_input(sid, f.filename, data)
+        except ValueError:
+            raise HTTPException(400, f"文件名非法：{f.filename}")
+        saved.append(p.name)
     return {"saved": saved, "inputs": session_store.list_inputs(sid)}
 
 
@@ -242,11 +273,18 @@ def rename_input(sid: str, filename: str, req: RenameInputReq) -> dict:
 
 
 # ---------- 生成（按步骤独立运行 + SSE 订阅）----------
+def _require_step(step: str) -> None:
+    """step 白名单校验：不在 STEP_KEYS 直接 400，避免越权 step 名进入运行器/文件层。"""
+    if step not in STEP_KEYS:
+        raise HTTPException(400, f"未知步骤：{step}")
+
+
 @router.post("/sessions/{sid}/run-step")
 def start_run_step(sid: str, step: str) -> dict:
     """启动单步生成任务。step ∈ transcript/chapters/minutes_concise/minutes_detailed/graph。
     幂等：同一 (sid, step) 已在跑就返回 already_running=True。
     """
+    _require_step(step)
     if not session_store.get(sid):
         raise HTTPException(404, "会话不存在")
     started = runner.start_step(sid, step)
@@ -263,6 +301,7 @@ def start_revise_step(sid: str, step: str, req: ReviseStepReq) -> dict:
     幂等：同一 (sid, step) 已在跑（生成或修订）就返回 already_running=True。
     进度复用 GET /run-step-stream?step=X（SSE）。
     """
+    _require_step(step)
     if not session_store.get(sid):
         raise HTTPException(404, "会话不存在")
     if not (req.instruction or "").strip():
@@ -271,18 +310,47 @@ def start_revise_step(sid: str, step: str, req: ReviseStepReq) -> dict:
     return {"started": started, "already_running": not started, "sid": sid, "step": step}
 
 
+def _sse(evt: dict) -> str:
+    return f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+
+
 @router.get("/sessions/{sid}/run-step-stream")
 def run_step_stream(sid: str, step: str) -> StreamingResponse:
-    """订阅单步生成进度（SSE）。已结束则一次性回放历史。"""
+    """订阅单步生成进度（SSE）。已结束则一次性回放历史。
+
+    用 async 生成器 + 非阻塞轮询，避免把整条流放进同步生成器长期占用线程池线程
+    （高并发订阅时会耗尽线程）。活跃任务用队列拉事件、空转让出事件循环、静默定期发 ping。
+    """
+    _require_step(step)
     if not session_store.get(sid):
         raise HTTPException(404, "会话不存在")
 
-    def gen():
+    async def gen():
+        q, run = runner.open_subscription(sid, step)
+        if q is None:
+            # 无活跃任务：一次性回放历史后结束。
+            for evt in runner.load_history(sid, step):
+                yield _sse(evt)
+            return
+        last_activity = time.monotonic()
         try:
-            for evt in runner.subscribe(sid, step):
-                yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
-        except Exception as e:  # noqa: BLE001
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            while True:
+                try:
+                    evt = q.get_nowait()
+                except queue.Empty:
+                    if time.monotonic() - last_activity >= 30:
+                        last_activity = time.monotonic()
+                        yield _sse({"type": "ping", "t": time.time()})
+                    await asyncio.sleep(0.15)
+                    continue
+                last_activity = time.monotonic()
+                if evt.get("type") == "_close":
+                    return
+                yield _sse(evt)
+                if evt.get("type") in ("done", "error"):
+                    return
+        finally:
+            runner.close_subscription(run, q)
 
     return StreamingResponse(
         gen(),
@@ -296,10 +364,9 @@ def get_progress(sid: str) -> dict:
     """一次性拉取所有步骤的进度（让前端首屏一次性恢复全部状态）。"""
     if not session_store.get(sid):
         raise HTTPException(404, "会话不存在")
-    steps = ["transcript", "chapters", "minutes_concise", "minutes_detailed", "graph"]
     return {
         "running": runner.running_steps(sid),
-        "by_step": {s: runner.load_history(sid, s) for s in steps},
+        "by_step": {s: runner.load_history(sid, s) for s in STEP_KEYS},
     }
 
 
@@ -500,10 +567,10 @@ def _version_filename(name: str, version: int) -> str:
     return f"{name}_v{version}"
 
 
-def _session_public(meta) -> dict:
+def _session_public(meta, include_resolved: bool = False) -> dict:
     # 实时扫描已存在的产出（含老文件名 → 新名 映射），不再依赖 meta.artifacts 落后状态
     artifacts = available_artifacts(meta.id)
-    return {
+    data = {
         "id": meta.id,
         "module": meta.module,
         "title": meta.title,
@@ -514,3 +581,8 @@ def _session_public(meta) -> dict:
         "created_at": meta.created_at,
         "updated_at": meta.updated_at,
     }
+    if include_resolved:
+        # 每步「最终生效」的 provider/model（含默认解析结果），供前端直接展示、免去重复逻辑。
+        # 解析要遍历 provider 配置，只在会话详情下发，避免拖慢会话列表。
+        data["resolved_step_models"] = resolve_step_models(meta)
+    return data

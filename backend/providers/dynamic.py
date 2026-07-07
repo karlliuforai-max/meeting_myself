@@ -40,6 +40,14 @@ class _ConfigMixin:
     def default_model(self) -> str:
         return self._cfg.get("default_model") or ""
 
+    @property
+    def max_output_tokens(self) -> int:
+        # 供应商级输出上限（0=不限制）；chat() 用它把每次 max_tokens 收敛到不超过模型能力。
+        try:
+            return max(0, int(self._cfg.get("max_output_tokens") or 0))
+        except (TypeError, ValueError):
+            return 0
+
     def list_models(self) -> List[str]:
         ms = list(self._cfg.get("models") or [])
         dm = self.default_model

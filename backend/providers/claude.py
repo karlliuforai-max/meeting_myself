@@ -6,9 +6,9 @@ _default_headers()。同时支持官方端点与第三方中转站。
 """
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
-from .base import BaseProvider, ChatResult, Message, ProviderError
+from .base import PROVIDER_TIMEOUT, BaseProvider, ChatResult, Message, ProviderError
 
 
 def _anthropic_content(m: Message) -> Union[str, list]:
@@ -40,40 +40,63 @@ class _AnthropicBase(BaseProvider):
     def _default_headers(self) -> Optional[dict]:
         return None  # 子类可覆盖（如中转站需伪装 UA 绕过 WAF）
 
+    def _client(self):
+        """惰性创建并缓存 Anthropic client（SDK 线程安全）：同一 provider 实例多次调用复用。"""
+        cached = getattr(self, "_client_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            import anthropic
+        except ImportError as e:  # pragma: no cover
+            raise ProviderError("未安装 anthropic SDK：pip install anthropic") from e
+        kwargs = {"api_key": self._api_key(), "timeout": PROVIDER_TIMEOUT}
+        if self._base_url():
+            kwargs["base_url"] = self._base_url()
+        if self._default_headers():
+            kwargs["default_headers"] = self._default_headers()
+        client = anthropic.Anthropic(**kwargs)
+        self._client_cache = client
+        return client
+
+    def _cap_tokens(self, max_tokens: int) -> int:
+        cap = getattr(self, "max_output_tokens", 0) or 0
+        return min(max_tokens, cap) if cap > 0 else max_tokens
+
     def chat(
         self,
         messages: List[Message],
         model: Optional[str] = None,
         temperature: float = 0.3,
         max_tokens: int = 4096,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> ChatResult:
         if not self._api_key():
             raise ProviderError(f"{self.name} 未配置 API key。")
-        try:
-            import anthropic
-        except ImportError as e:  # pragma: no cover
-            raise ProviderError("未安装 anthropic SDK：pip install anthropic") from e
-
-        kwargs = {"api_key": self._api_key()}
-        if self._base_url():
-            kwargs["base_url"] = self._base_url()
-        if self._default_headers():
-            kwargs["default_headers"] = self._default_headers()
-        client = anthropic.Anthropic(**kwargs)
+        client = self._client()
         # 优先用显式传入的模型，否则用本 provider 自己的默认模型
         model = model or self.default_model
+        max_tokens = self._cap_tokens(max_tokens)
 
         # Anthropic：system 单列，其余进 messages
         system_parts = [m.content for m in messages if m.role == "system"]
+        system = "\n\n".join(system_parts) or None
         chat_msgs = [
             {"role": m.role, "content": _anthropic_content(m)}
             for m in messages
             if m.role in ("user", "assistant")
         ]
+
+        if on_delta is not None:
+            streamed = self._chat_stream(client, model, system, chat_msgs,
+                                         temperature, max_tokens, on_delta)
+            if streamed is not None:
+                return streamed
+            # 首个 delta 之前失败（中转站不支持 stream）→ 降级非流式。
+
         try:
             resp = client.messages.create(
                 model=model,
-                system="\n\n".join(system_parts) or None,
+                system=system,
                 messages=chat_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -84,10 +107,46 @@ class _AnthropicBase(BaseProvider):
         text = "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         )
-        usage = {}
-        if getattr(resp, "usage", None):
-            usage = {
-                "input_tokens": resp.usage.input_tokens,
-                "output_tokens": resp.usage.output_tokens,
-            }
-        return ChatResult(text=text, model=model, provider=self.name, usage=usage)
+        finish = _normalize_finish(getattr(resp, "stop_reason", None))
+        usage = _usage_of(getattr(resp, "usage", None))
+        return ChatResult(text=text, model=model, provider=self.name, usage=usage, finish_reason=finish)
+
+    def _chat_stream(self, client, model, system, chat_msgs, temperature, max_tokens, on_delta):
+        """流式路径。首个 delta 到达前抛错则返回 None 让调用方降级。"""
+        chunks: List[str] = []
+        got_first = False
+        try:
+            create_kwargs = dict(
+                model=model, system=system, messages=chat_msgs,
+                temperature=temperature, max_tokens=max_tokens,
+            )
+            with client.messages.stream(**create_kwargs) as stream:
+                for piece in stream.text_stream:
+                    if piece:
+                        chunks.append(piece)
+                        got_first = True
+                        on_delta(piece)
+                final = stream.get_final_message()
+        except Exception as e:  # noqa: BLE001
+            if got_first:
+                raise ProviderError(f"{self.name} 调用失败：{e}") from e
+            return None
+        finish = _normalize_finish(getattr(final, "stop_reason", None))
+        usage = _usage_of(getattr(final, "usage", None))
+        return ChatResult(
+            text="".join(chunks), model=model, provider=self.name,
+            usage=usage, finish_reason=finish,
+        )
+
+
+def _normalize_finish(reason: Optional[str]) -> str:
+    return "length" if reason == "max_tokens" else "stop"
+
+
+def _usage_of(usage) -> dict:
+    if not usage:
+        return {}
+    return {
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+    }

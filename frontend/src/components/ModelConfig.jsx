@@ -25,6 +25,9 @@ const BLANK = {
   modelsText: "",
   default_model: "",
   supports_vision: false,
+  max_output_tokens: "", // 空=不限制
+  hasKey: false, // 该供应商是否已存有 key（后端不再回明文）
+  api_key_masked: "", // 掩码展示（如 "sk-1…abcd"）
 };
 
 // 模型配置中心：左列供应商列表 + 右侧编辑表单。支持增删改、设默认、连通测试。
@@ -89,16 +92,19 @@ export default function ModelConfig({ onClose, onChanged }) {
     setTest(null);
     setErr("");
     try {
-      const c = await api.getProvider(pid); // 含 api_key
+      const c = await api.getProvider(pid); // 不再含明文 api_key，仅掩码/has_key
       setForm({
         id: c.id,
         label: c.label || "",
         kind: c.kind || "openai",
         base_url: c.base_url || "",
-        api_key: c.api_key || "",
+        api_key: "", // 拿不到明文；留空表示「保持不变」
         modelsText: (c.models || []).join("\n"),
         default_model: c.default_model || "",
         supports_vision: !!c.supports_vision,
+        max_output_tokens: c.max_output_tokens ? String(c.max_output_tokens) : "",
+        hasKey: !!c.has_key,
+        api_key_masked: c.api_key_masked || "",
       });
     } catch (e) {
       setErr(e.message);
@@ -110,15 +116,23 @@ export default function ModelConfig({ onClose, onChanged }) {
       .split("\n")
       .map((s) => s.trim())
       .filter(Boolean);
-    return {
+    const maxTokens = parseInt(form.max_output_tokens, 10);
+    const body = {
       label: form.label.trim() || "未命名",
       kind: form.kind,
       base_url: form.base_url.trim(),
-      api_key: form.api_key.trim(),
       models,
       default_model: form.default_model.trim() || models[0] || "",
       supports_vision: form.supports_vision,
+      max_output_tokens: Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : 0,
     };
+    // PUT 为 patch 语义：编辑已有供应商且 key 框留空（且已存 key）时不带 api_key，保留原 key。
+    // 新增供应商，或用户敲了新 key 时正常带上（含清空为空串的情形）。
+    const keyTyped = form.api_key.trim();
+    if (!(form.id && !keyTyped && form.hasKey)) {
+      body.api_key = keyTyped;
+    }
+    return body;
   }
 
   async function save() {
@@ -166,7 +180,12 @@ export default function ModelConfig({ onClose, onChanged }) {
     setTest(null);
     setErr("");
     try {
-      const r = await api.testProvider({ config: payload() });
+      // 编辑已有供应商且 key 框为空：带上 provider id，后端借用已存 key 测试草稿。
+      const body =
+        form.id && !form.api_key.trim()
+          ? { provider: form.id, config: payload() }
+          : { config: payload() };
+      const r = await api.testProvider(body);
       setTest(r);
     } catch (e) {
       setTest({ ok: false, error: e.message });
@@ -260,7 +279,11 @@ export default function ModelConfig({ onClose, onChanged }) {
                   type={showKey ? "text" : "password"}
                   value={form.api_key}
                   onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-                  placeholder="sk-..."
+                  placeholder={
+                    form.id && form.hasKey
+                      ? `已保存（${form.api_key_masked || "已设置"}）· 留空保持不变`
+                      : "sk-..."
+                  }
                 />
                 <button
                   type="button"
@@ -298,6 +321,18 @@ export default function ModelConfig({ onClose, onChanged }) {
                   ))}
                 </select>
               )}
+            </label>
+
+            <label className="mc-field">
+              <span>输出上限 max_output_tokens<small className="muted">（可留空=不限制）</small></span>
+              <input
+                type="number"
+                min="0"
+                value={form.max_output_tokens}
+                onChange={(e) => setForm({ ...form, max_output_tokens: e.target.value })}
+                placeholder="留空或 0 = 不限制"
+              />
+              <small className="muted">该供应商单次回复的最大 token 数；超出模型能力的请求会被自动收敛到此值。</small>
             </label>
 
             <label className="mc-check">

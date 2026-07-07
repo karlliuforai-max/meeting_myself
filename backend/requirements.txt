@@ -10,3 +10,6 @@ openai>=1.30
 pypdf>=4.0
 Pillow>=10.0
 PyYAML>=6.0
+
+# 测试
+pytest>=8.0
