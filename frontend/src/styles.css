@@ -1228,3 +1228,130 @@ input[type="file"] {
   flex-shrink: 0;
   white-space: nowrap;
 }
+
+/* ============================================================
+   v0.8.0 画像 & 笔记校对
+   ============================================================ */
+
+/* ---------- 个人画像弹窗 ---------- */
+.modal.persona-modal {
+  width: min(560px, 96vw);
+}
+.persona-body {
+  padding: 18px 22px 22px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.persona-body textarea {
+  margin-top: 0;
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+.persona-body .persona-tip {
+  margin: 0;
+}
+.persona-body .row-actions {
+  margin-top: 2px;
+}
+
+/* ---------- 工作台：本项目画像小节 ---------- */
+.persona-section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+.persona-section-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 4px;
+}
+.persona-section p {
+  margin: 0 0 6px;
+}
+.persona-section textarea {
+  margin-top: 0;
+  font-size: 13.5px;
+}
+
+/* ---------- 笔记照片状态徽标（沿用 ok/off badge 风格） ---------- */
+.note-chip {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 20px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.note-chip.user {
+  background: #e6efe2;
+  color: #3f6b34;
+  border-color: #cadcc0;
+}
+.note-chip.cached {
+  background: var(--clay-soft);
+  color: var(--clay-deep);
+  border-color: #ecd3c8;
+}
+.note-chip.none {
+  background: var(--ivory-hover);
+  color: var(--muted);
+  border-color: var(--border);
+}
+
+/* ---------- 文件项：行 + 下方笔记面板 ---------- */
+.file-item {
+  display: flex;
+  flex-direction: column;
+}
+.file-act.active {
+  border-color: var(--clay);
+  color: var(--clay-deep);
+  background: var(--clay-soft);
+}
+
+/* ---------- 笔记校对面板（与 revise-box 风格一致） ---------- */
+.note-panel {
+  margin: 6px 0 2px;
+  padding: 14px 14px 12px;
+  background: var(--ivory-card);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.note-panel-tip {
+  margin: 0;
+}
+.note-textarea {
+  margin-top: 0;
+  resize: vertical;
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+.note-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.note-actions .primary {
+  padding: 7px 18px;
+  font-size: 13.5px;
+}
+.banner.note-machine-hint {
+  background: #fbf3e6;
+  color: #946b1f;
+  border: 1px solid #ead7af;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}

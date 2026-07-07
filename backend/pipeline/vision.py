@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
@@ -50,9 +51,28 @@ def resolve_vision_provider() -> Tuple[Optional[object], Optional[str]]:
     return None, None
 
 
+def _sniff_media_type(data: bytes, fallback: str) -> str:
+    """按文件魔数嗅探真实图片类型；识别不出时用 fallback（扩展名推断）。
+
+    扩展名与内容不一致的图片（如 .jpg 实为 PNG）如果按扩展名声明 media_type，
+    Anthropic 端会直接 400 拒绝——真实用户素材里这种错配确实出现过，必须以内容为准。
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    return fallback
+
+
 def _prepare_image(data: bytes, media_type: str) -> Tuple[str, str]:
     """返回 (base64 字符串, media_type)。若 Pillow 可用且图片过大则降采样为 JPEG。
-    Pillow 不可用或处理失败时，原样 base64 编码（优雅降级）。"""
+    Pillow 不可用或处理失败时，原样 base64 编码，但 media_type 以魔数嗅探为准。"""
     try:
         from PIL import Image  # 可选依赖
 
@@ -67,8 +87,8 @@ def _prepare_image(data: bytes, media_type: str) -> Tuple[str, str]:
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=85)
         return base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
-    except Exception:  # noqa: BLE001 — 任何失败都回退原图
-        return base64.b64encode(data).decode("ascii"), media_type
+    except Exception:  # noqa: BLE001 — 任何失败都回退原图（media_type 仍按内容嗅探）
+        return base64.b64encode(data).decode("ascii"), _sniff_media_type(data, media_type)
 
 
 def transcribe_image(provider, model, data: bytes, media_type: str, pre_prompt: str = "") -> str:
@@ -86,12 +106,13 @@ def collect_note_text(sid: str, pre_prompt: str = "") -> Tuple[str, dict]:
     """收集本会话所有图片素材的转录文本（带缓存），返回 (合并文本, 统计信息)。
 
     info 字段：images（图片数）、vision（是否有可用视觉模型）、provider（标签）、
-    transcribed（本次新转录数）、cached（命中缓存数）、failed（转录失败数）。
+    transcribed（本次新转录数）、cached（命中缓存数）、failed（转录失败数）、
+    failures（{文件名: 失败原因摘要}，供调用方逐张透传给用户）。
     没有图片时 text 为空、images=0；有图片但无视觉模型时 vision=False（调用方应提示）。
     """
     images = session_store.list_image_inputs(sid)
     info = {"images": len(images), "vision": False, "provider": "",
-            "transcribed": 0, "cached": 0, "failed": 0}
+            "transcribed": 0, "cached": 0, "failed": 0, "failures": {}}
     if not images:
         return "", info
 
@@ -117,28 +138,47 @@ def collect_note_text(sid: str, pre_prompt: str = "") -> Tuple[str, dict]:
     info["vision"] = True
     info["provider"] = getattr(provider, "label", "") if provider else ""
 
-    def _do(fn: str) -> Tuple[str, Optional[str]]:
+    def _do(fn: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """转录单张：返回 (文件名, 文本或None, 错误摘要或None)。
+
+        失败自动重试一次（共两次尝试，间隔 0.5s）：视觉模型偶发限流/超时，
+        一次瞬时失败不该让整张笔记直接丢掉。两次都失败时把 str(e) 作为原因透传。
+        """
         data = session_store.read_input_bytes(sid, fn)
         if data is None:
-            return fn, None
-        try:
-            text = transcribe_image(provider, model, data, session_store.image_media_type(fn), pre_prompt)
-        except ProviderError:
-            return fn, None
-        if text:
-            session_store.write_note_cache(sid, fn, text)
-        return fn, (text or None)
+            return fn, None, "读取图片失败（文件不存在或已被删除）"
+        last_err: Optional[str] = None
+        for attempt in range(2):
+            try:
+                text = transcribe_image(
+                    provider, model, data, session_store.image_media_type(fn), pre_prompt
+                )
+            except ProviderError as e:
+                last_err = str(e) or "视觉模型调用失败"
+                if attempt == 0:
+                    time.sleep(0.5)
+                continue
+            if text:
+                session_store.write_note_cache(sid, fn, text)
+                return fn, text, None
+            # 模型返回空文本：不算异常，但也没有可用转录，记为失败原因。
+            last_err = "视觉模型返回空转录内容"
+            if attempt == 0:
+                time.sleep(0.5)
+        return fn, None, last_err
 
     results: dict = dict(cached)
     info["cached"] = len(cached)
     if todo:
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL) as ex:
-            for fn, text in ex.map(_do, todo):
+            for fn, text, err in ex.map(_do, todo):
                 if text:
                     results[fn] = text
                     info["transcribed"] += 1
                 else:
                     info["failed"] += 1
+                    # 失败原因摘要截断，避免超长错误撑爆进度消息/前端。
+                    info["failures"][fn] = (err or "识别失败")[:120]
 
     blocks = [_note_block(fn, results[fn]) for fn in images if fn in results and results[fn]]
     return "\n\n".join(blocks), info

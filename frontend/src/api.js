@@ -118,4 +118,24 @@ export const api = {
   // 设置某步骤的模型（provider/model 留空 = 重置为默认）
   setStepModel: (id, body) =>
     req(`/sessions/${id}/step-model`, { method: "PUT", body: JSON.stringify(body) }),
+  // ---- 个人画像 ----
+  // 全局画像：{text, default}
+  getPersona: () => req("/persona"),
+  // 保存全局画像（空串=清除、回退系统默认）
+  setPersona: (text) =>
+    req("/persona", { method: "PUT", body: JSON.stringify({ text: text || "" }) }),
+  // ---- 课堂笔记照片转录状态与校对 ----
+  // 列出会话内图片笔记：{notes: [{filename, status, text}]}
+  listNotes: (id) => req(`/sessions/${id}/notes`),
+  // 保存用户校对（空串=删除校对、恢复自动）
+  saveNote: (id, filename, text) =>
+    req(`/sessions/${id}/notes/${encodeURIComponent(filename)}`, {
+      method: "PUT",
+      body: JSON.stringify({ text: text || "" }),
+    }),
+  // 强制重新机器识别；错误在 body（HTTP 200）
+  transcribeNote: (id, filename) =>
+    req(`/sessions/${id}/notes/${encodeURIComponent(filename)}/transcribe`, {
+      method: "POST",
+    }),
 };

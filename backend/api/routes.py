@@ -21,9 +21,10 @@ from pydantic import BaseModel
 
 from config import APP_VERSION
 from modules import get_module, list_modules
-from pipeline import STEP_KEYS, available_artifacts, resolve_step_models, runner
+from pipeline import STEP_KEYS, available_artifacts, resolve_step_models, runner, vision
 from providers import Message, ProviderError, build_provider, get_provider, list_providers
 from providers import store as provider_store
+from storage import persona as persona_store
 from storage import session_store
 
 router = APIRouter(prefix="/api")
@@ -40,6 +41,27 @@ def health() -> dict:
 @router.get("/modules")
 def modules() -> dict:
     return {"modules": list_modules()}
+
+
+# ---------- 个人画像（全局，跨会话复用；会话可覆盖，见 PATCH /sessions）----------
+def _persona_public() -> dict:
+    """全局画像对外结构：text 为当前全局画像（空=未设置），default 为系统默认身份。"""
+    return {"text": persona_store.get_global(), "default": persona_store.DEFAULT_PERSONA}
+
+
+@router.get("/persona")
+def get_persona() -> dict:
+    return _persona_public()
+
+
+class PersonaReq(BaseModel):
+    text: str = ""  # 空串 = 清除全局画像、恢复系统默认
+
+
+@router.put("/persona")
+def set_persona(req: PersonaReq) -> dict:
+    persona_store.set_global(req.text)
+    return _persona_public()
 
 
 # ---------- 模型 / Provider ----------
@@ -210,6 +232,7 @@ def get_session(sid: str) -> dict:
 class UpdateSessionReq(BaseModel):
     title: Optional[str] = None
     pre_prompt: Optional[str] = None
+    persona: Optional[str] = None  # 项目级画像；传空串=清除项目级、回退全局/系统默认
 
 
 @router.patch("/sessions/{sid}")
@@ -219,6 +242,9 @@ def update_session(sid: str, req: UpdateSessionReq) -> dict:
             meta.title = req.title
         if req.pre_prompt is not None:
             meta.pre_prompt = req.pre_prompt
+        if req.persona is not None:
+            # 空串=清除项目级画像（effective 会回退到全局/系统默认）。
+            meta.persona = req.persona.strip()
 
     meta = session_store.mutate(sid, apply)
     if not meta:
@@ -270,6 +296,81 @@ def rename_input(sid: str, filename: str, req: RenameInputReq) -> dict:
     if not new_name:
         raise HTTPException(400, "重命名失败：源文件不存在 / 名称非法 / 目标已存在")
     return {"renamed": {"from": filename, "to": new_name}, "inputs": session_store.list_inputs(sid)}
+
+
+# ---------- 笔记照片转录：状态查询 / 用户校对 / 强制重转 ----------
+def _require_image_input(sid: str, filename: str) -> None:
+    """校验图片输入存在且确为图片类型；否则 404。会话存在性由调用方先行校验。"""
+    from pathlib import Path
+
+    if not session_store.input_path(sid, filename):
+        raise HTTPException(404, "图片素材不存在")
+    if Path(filename).suffix.lower() not in session_store.IMAGE_EXTS:
+        raise HTTPException(404, "该文件不是图片素材")
+
+
+@router.get("/sessions/{sid}/notes")
+def list_notes(sid: str) -> dict:
+    """列出本会话每张笔记照片的转录状态（user/cached/none 三态 + 当前生效文本）。"""
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    return {"notes": [session_store.note_status(sid, fn)
+                      for fn in session_store.list_image_inputs(sid)]}
+
+
+class NoteEditReq(BaseModel):
+    text: str = ""  # 空串 = 删除用户校对覆盖、恢复自动机器识别
+
+
+@router.put("/sessions/{sid}/notes/{filename}")
+def edit_note(sid: str, filename: str, req: NoteEditReq) -> dict:
+    """保存用户对某张笔记照片的人工校对（空串=删除覆盖恢复自动）。返回该图新状态。"""
+    if not session_store.get(sid):
+        raise HTTPException(404, "会话不存在")
+    _require_image_input(sid, filename)
+    session_store.write_user_note(sid, filename, req.text)
+    return session_store.note_status(sid, filename)
+
+
+@router.post("/sessions/{sid}/notes/{filename}/transcribe")
+def transcribe_note(sid: str, filename: str) -> dict:
+    """强制重新机器转录该图（忽略一切缓存）。
+
+    同步阻塞（单张图可接受，由 FastAPI 线程池执行）。成功写机器缓存并返回新状态；
+    失败把具体原因放在 body（HTTP 200），便于前端直接展示、区分限流/无模型/图糊。
+    注意：若存在用户校对覆盖，note_status 仍报 "user"（用户校对优先），
+    故额外用 machine_text 字段回传本次机器结果供前端预览。"""
+    meta = session_store.get(sid)
+    if not meta:
+        raise HTTPException(404, "会话不存在")
+    _require_image_input(sid, filename)
+
+    data = session_store.read_input_bytes(sid, filename)
+    if data is None:
+        return {"ok": False, "error": "读取图片失败（文件可能已被删除）",
+                **session_store.note_status(sid, filename)}
+
+    provider, model = vision.resolve_vision_provider()
+    if provider is None:
+        return {"ok": False,
+                "error": "未配置可用的图片识别模型，请在右上角「模型配置」面板设置「图片识别模型」后重试。",
+                **session_store.note_status(sid, filename)}
+
+    try:
+        text = vision.transcribe_image(
+            provider, model, data, session_store.image_media_type(filename), meta.pre_prompt or ""
+        )
+    except ProviderError as e:
+        return {"ok": False, "error": str(e) or "视觉模型调用失败",
+                **session_store.note_status(sid, filename)}
+
+    if not (text or "").strip():
+        return {"ok": False, "error": "视觉模型返回空转录内容，请重试或更换图片识别模型。",
+                **session_store.note_status(sid, filename)}
+
+    session_store.write_note_cache(sid, filename, text)
+    # machine_text 恒为本次机器结果；note_status 反映当前生效来源（有用户校对则仍为 user）。
+    return {"ok": True, "machine_text": text, **session_store.note_status(sid, filename)}
 
 
 # ---------- 生成（按步骤独立运行 + SSE 订阅）----------
@@ -575,6 +676,8 @@ def _session_public(meta, include_resolved: bool = False) -> dict:
         "module": meta.module,
         "title": meta.title,
         "pre_prompt": meta.pre_prompt,
+        # 项目级画像原值（老会话缺该字段时 getattr 容错为 ""）。
+        "persona": getattr(meta, "persona", "") or "",
         "step_models": meta.step_models or {},
         "status": meta.status,
         "artifacts": artifacts,
@@ -585,4 +688,6 @@ def _session_public(meta, include_resolved: bool = False) -> dict:
         # 每步「最终生效」的 provider/model（含默认解析结果），供前端直接展示、免去重复逻辑。
         # 解析要遍历 provider 配置，只在会话详情下发，避免拖慢会话列表。
         data["resolved_step_models"] = resolve_step_models(meta)
+        # 生效画像（项目>全局>默认），同 resolved_step_models：只在详情下发，避免拖慢列表。
+        data["effective_persona"] = persona_store.effective(meta)
     return data

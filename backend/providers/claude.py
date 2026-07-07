@@ -93,16 +93,23 @@ class _AnthropicBase(BaseProvider):
                 return streamed
             # 首个 delta 之前失败（中转站不支持 stream）→ 降级非流式。
 
-        try:
-            resp = client.messages.create(
-                model=model,
-                system=system,
-                messages=chat_msgs,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"{self.name} 调用失败：{e}") from e
+        # 部分新模型/中转站拒绝 temperature 参数（"deprecated/unsupported"）：
+        # 首次被拒时去掉该参数重试一次，并记在实例上（同一实例后续调用不再发送）。
+        resp = None
+        send_temp = not getattr(self, "_no_temperature", False)
+        for attempt in (0, 1):
+            kwargs = dict(model=model, system=system, messages=chat_msgs, max_tokens=max_tokens)
+            if send_temp:
+                kwargs["temperature"] = temperature
+            try:
+                resp = client.messages.create(**kwargs)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0 and send_temp and _temperature_rejected(e):
+                    self._no_temperature = True
+                    send_temp = False
+                    continue
+                raise ProviderError(f"{self.name} 调用失败：{e}") from e
 
         text = "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
@@ -117,9 +124,10 @@ class _AnthropicBase(BaseProvider):
         got_first = False
         try:
             create_kwargs = dict(
-                model=model, system=system, messages=chat_msgs,
-                temperature=temperature, max_tokens=max_tokens,
+                model=model, system=system, messages=chat_msgs, max_tokens=max_tokens,
             )
+            if not getattr(self, "_no_temperature", False):
+                create_kwargs["temperature"] = temperature
             with client.messages.stream(**create_kwargs) as stream:
                 for piece in stream.text_stream:
                     if piece:
@@ -130,6 +138,9 @@ class _AnthropicBase(BaseProvider):
         except Exception as e:  # noqa: BLE001
             if got_first:
                 raise ProviderError(f"{self.name} 调用失败：{e}") from e
+            if _temperature_rejected(e):
+                # 记住拒绝原因，让紧随其后的非流式降级重试直接不带 temperature。
+                self._no_temperature = True
             return None
         finish = _normalize_finish(getattr(final, "stop_reason", None))
         usage = _usage_of(getattr(final, "usage", None))
@@ -137,6 +148,14 @@ class _AnthropicBase(BaseProvider):
             text="".join(chunks), model=model, provider=self.name,
             usage=usage, finish_reason=finish,
         )
+
+
+def _temperature_rejected(err: Exception) -> bool:
+    """判断报错是否为「该模型不接受 temperature 参数」（新模型/中转站映射常见）。"""
+    s = str(err).lower()
+    return "temperature" in s and any(
+        k in s for k in ("deprecated", "unsupported", "not supported", "不支持")
+    )
 
 
 def _normalize_finish(reason: Optional[str]) -> str:

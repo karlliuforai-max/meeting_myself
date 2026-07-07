@@ -63,6 +63,7 @@ class SessionMeta:
     created_at: float
     updated_at: float
     pre_prompt: str = ""      # 任务前·自定义补充提示词（背景 + 重点要求）
+    persona: str = ""         # 项目级学员画像（空=回退全局/系统默认，见 storage.persona）
     step_models: dict = field(default_factory=dict)   # 步骤 -> {provider, model}
     status: str = "created"   # created | processing | done | error
     artifacts: List[str] = field(default_factory=list)  # 已生成产出名
@@ -247,8 +248,25 @@ class SessionStore:
         safe = filename.replace("/", "_").replace("\\", "_")
         return self._dir(sid) / "derived" / "notes" / f"{safe}.{mtime}.md"
 
+    def _user_note_path(self, sid: str, filename: str) -> Optional[Path]:
+        """用户校对覆盖文件路径 derived/notes/<safe>.user.md（safe 转义同机器缓存）。
+
+        与机器缓存不同：不带 mtime——用户校对是人工确认的结果，不该随图片改动自动失效。
+        文件名须先通过 input_path 校验存在，杜绝路径穿越。"""
+        p = self.input_path(sid, filename)
+        if not p:
+            return None
+        safe = filename.replace("/", "_").replace("\\", "_")
+        return self._dir(sid) / "derived" / "notes" / f"{safe}.user.md"
+
     def read_note_cache(self, sid: str, filename: str) -> Optional[str]:
-        """读取该图片的转录缓存；图片不存在或 mtime 已变（缓存失效）返回 None。"""
+        """读取该图片的转录文本：用户校对覆盖优先，其次机器缓存。
+
+        用户覆盖（<safe>.user.md）存在即返回其内容，【不看 mtime】——人工校对结果
+        不随图片改动失效；否则走机器缓存（图片不存在或 mtime 已变则返回 None）。"""
+        up = self._user_note_path(sid, filename)
+        if up and up.exists():
+            return up.read_text(encoding="utf-8")
         cp = self._note_cache_path(sid, filename)
         if cp and cp.exists():
             return cp.read_text(encoding="utf-8")
@@ -259,11 +277,43 @@ class SessionStore:
         if not cp:
             return
         cp.parent.mkdir(parents=True, exist_ok=True)
-        # 清掉同一文件的旧 mtime 缓存，避免无限堆积
+        # 清掉同一文件的旧 mtime 缓存，避免无限堆积。
+        # 注意：glob `<safe>.*.md` 会同时命中用户覆盖 `<safe>.user.md`，必须显式跳过，
+        # 否则强制重转会误删用户人工校对（.user.md 不受 mtime 管理，见 read_note_cache）。
         for old in cp.parent.glob(f"{cp.name.rsplit('.', 2)[0]}.*.md"):
-            if old != cp:
+            if old != cp and old.name != f"{cp.name.rsplit('.', 2)[0]}.user.md":
                 old.unlink(missing_ok=True)
         cp.write_text(text, encoding="utf-8")
+
+    def write_user_note(self, sid: str, filename: str, text: str) -> bool:
+        """写入/清除用户校对覆盖。text 为空串=删除覆盖（恢复自动机器识别）。
+
+        返回是否成功；filename 须通过 input_path 校验存在（不存在返回 False）。"""
+        up = self._user_note_path(sid, filename)
+        if not up:
+            return False
+        if not (text or "").strip():
+            # 空串=恢复自动：删掉覆盖文件即可，read_note_cache 回落到机器缓存。
+            up.unlink(missing_ok=True)
+            return True
+        up.parent.mkdir(parents=True, exist_ok=True)
+        # 原子写：先写临时文件再 os.replace，避免写到一半被读到半截。
+        tmp = up.with_suffix(".md.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, up)
+        return True
+
+    def note_status(self, sid: str, filename: str) -> dict:
+        """单张图片的转录状态：user（有用户校对）/ cached（机器缓存有效）/ none（无）。
+
+        text 为当前生效文本（user 用覆盖内容，cached 用机器缓存内容，none 为 None）。"""
+        up = self._user_note_path(sid, filename)
+        if up and up.exists():
+            return {"filename": filename, "status": "user", "text": up.read_text(encoding="utf-8")}
+        cp = self._note_cache_path(sid, filename)
+        if cp and cp.exists():
+            return {"filename": filename, "status": "cached", "text": cp.read_text(encoding="utf-8")}
+        return {"filename": filename, "status": "none", "text": None}
 
     # ---- 产出（artifacts）与版本 ----
     def artifact_exists(self, sid: str, name: str) -> bool:

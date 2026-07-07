@@ -28,7 +28,7 @@ MODULE = ModuleDef(
             title="实录",
             output_name="实录.md",
             default_model="deepseek-v4-flash",
-            description="基于原始转写稿，去口水词、纠正音近形近字与人名公司名术语；按 10 分钟分段。是后续一切的基础。",
+            description="基于原始转写稿，去口水词、纠正音近形近字与人名公司名术语；含时间锚点小标题。是后续一切的基础。",
         ),
         StepDef(
             key="chapters",
@@ -49,9 +49,9 @@ MODULE = ModuleDef(
             key="minutes_detailed",
             title="笺注",
             output_name="笺注.md",
-            requires=["transcript"],
+            requires=["transcript", "chapters"],
             default_model="claude-sonnet-4-6",
-            description="如古籍笺注般完整深入的详尽纪要，知识点充分展开。便于深度学习。",
+            description="按纲目逐阶段展开的深度笺注：核心论点、论证链、例证摘引、现场问答，完整收录不注水。便于深度学习。",
         ),
         StepDef(
             key="graph",

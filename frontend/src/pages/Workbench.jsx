@@ -16,11 +16,20 @@ const isImageFile = (name) =>
  * 每个产出独立选模型、独立生成、独立看内容。
  * 依赖未满足时 Tab 会变灰提示，按钮也会禁用。
  */
-export default function Workbench({ module, sessionId, onBack, providersVersion = 0 }) {
+export default function Workbench({ module, sessionId, onBack, providersVersion = 0, personaVersion = 0 }) {
   const [session, setSession] = useState(null);
   const [providers, setProviders] = useState([]);
   const [prePrompt, setPrePrompt] = useState("");
+  const [persona, setPersona] = useState(""); // 项目级画像输入
   const [savedHint, setSavedHint] = useState("");
+
+  // 课堂笔记照片转录：filename → {status, text}
+  const [notes, setNotes] = useState({});
+  const [openNote, setOpenNote] = useState(null); // 当前展开笔记面板的图片文件名（同一时间仅一个）
+  const [noteText, setNoteText] = useState(""); // 当前展开面板的编辑草稿
+  const [noteBusy, setNoteBusy] = useState(false); // 重新识别进行中
+  const [noteErr, setNoteErr] = useState(""); // 识别失败提示
+  const [noteMachineText, setNoteMachineText] = useState(null); // 重新识别拿到但用户校对仍生效时的机器结果
   const [uploading, setUploading] = useState(false);
   const [activeKey, setActiveKey] = useState(module.steps[0]?.key);
 
@@ -58,6 +67,7 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     api.getSession(sessionId).then((s) => {
       setSession(s);
       setPrePrompt(s.pre_prompt || "");
+      setPersona(s.persona || "");
       module.steps.forEach((step) => {
         if ((s.artifacts || []).includes(step.output_name)) {
           api.getArtifact(sessionId, step.output_name).then((a) => {
@@ -66,7 +76,26 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
           });
         }
       });
+      // 有图片素材才拉笔记转录状态
+      if ((s.inputs || []).some(isImageFile)) {
+        loadNotes();
+      } else {
+        setNotes({});
+      }
     });
+  }
+
+  function loadNotes() {
+    api
+      .listNotes(sessionId)
+      .then((d) => {
+        const map = {};
+        (d.notes || []).forEach((n) => {
+          map[n.filename] = { status: n.status, text: n.text || "" };
+        });
+        setNotes(map);
+      })
+      .catch(() => {});
   }
 
   // 首次加载：会话 + provider 列表 + 各步骤进度（恢复 UI）
@@ -108,10 +137,23 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providersVersion]);
 
+  // 全局画像变更后：刷新会话以更新 effective_persona（项目未单独设时会随之变化）
+  useEffect(() => {
+    if (personaVersion > 0) {
+      api.getSession(sessionId).then(setSession);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [personaVersion]);
+
   async function savePrePrompt() {
-    await api.updateSession(sessionId, { pre_prompt: prePrompt });
+    // 背景与项目级画像一起保存（persona 空串=清除项目级、回退继承）
+    await api.updateSession(sessionId, { pre_prompt: prePrompt, persona });
     setSavedHint("已保存");
     setTimeout(() => setSavedHint(""), 1800);
+    // 重新拉取会话刷新 effective_persona
+    const s = await api.getSession(sessionId);
+    setSession(s);
+    setPersona(s.persona || "");
   }
 
   async function onFiles(e) {
@@ -163,6 +205,62 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
     } catch (e) {
       alert("重命名失败：" + e.message);
     }
+  }
+
+  // ---- 课堂笔记照片：展开/收起 + 校对/恢复/重新识别 ----
+  function toggleNote(f) {
+    if (openNote === f) {
+      setOpenNote(null);
+      return;
+    }
+    setOpenNote(f);
+    setNoteText(notes[f]?.text || "");
+    setNoteErr("");
+    setNoteMachineText(null);
+  }
+
+  // 保存用户校对（有文字=生效为 user；空串=删除校对回退自动）
+  async function commitNote(f, text) {
+    setNoteErr("");
+    try {
+      const r = await api.saveNote(sessionId, f, text);
+      setNotes((m) => ({ ...m, [f]: { status: r.status, text: r.text || "" } }));
+      setNoteText(r.text || "");
+      setNoteMachineText(null);
+    } catch (e) {
+      setNoteErr(e.message);
+    }
+  }
+
+  // 强制重新机器识别（错误在 body，HTTP 200）
+  async function reTranscribe(f) {
+    setNoteBusy(true);
+    setNoteErr("");
+    setNoteMachineText(null);
+    try {
+      const r = await api.transcribeNote(sessionId, f);
+      if (!r.ok) {
+        setNoteErr(r.error || "识别失败");
+        return;
+      }
+      setNotes((m) => ({ ...m, [f]: { status: r.status, text: r.text || "" } }));
+      // 用户校对仍生效时，机器结果不直接覆盖，交由用户决定
+      if (r.status === "user" && r.machine_text) {
+        setNoteMachineText(r.machine_text);
+      } else {
+        setNoteText(r.text || "");
+      }
+    } catch (e) {
+      setNoteErr(e.message);
+    } finally {
+      setNoteBusy(false);
+    }
+  }
+
+  function noteChip(status) {
+    if (status === "user") return <span className="note-chip user">✅ 已校对</span>;
+    if (status === "cached") return <span className="note-chip cached">✅ 已识别</span>;
+    return <span className="note-chip none">⬜ 未识别</span>;
   }
 
   function setStatus(key, patch) {
@@ -302,6 +400,14 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
 
   if (!session) return <div className="empty">加载项目…</div>;
   const hasInputs = session.inputs?.length > 0;
+  // 项目级画像 placeholder：非 project 时提示会继承谁
+  const effPersona = session.effective_persona || {};
+  const effText = effPersona.text || "";
+  const effTrunc = effText.length > 80 ? effText.slice(0, 80) + "…" : effText;
+  const personaPlaceholder =
+    effPersona.source === "project"
+      ? "本项目已设置画像；清空并保存可回退到继承"
+      : `留空则继承${effPersona.source === "global" ? "全局画像" : "系统默认"}：${effTrunc}`;
   const hasArtifacts = (session.artifacts || []).length > 0;
   const activeDep = checkDeps(activeStep);
   const activeStatus = stepStatus[activeStep.key] || {};
@@ -392,33 +498,106 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
         </div>
         <div className="file-list">
           {hasInputs ? (
-            session.inputs.map((f) => (
-              <div className="file-row" key={f}>
-                {editingFile === f ? (
-                  <InlineEdit
-                    initial={f.lastIndexOf(".") > 0 ? f.slice(0, f.lastIndexOf(".")) : f}
-                    className="file-name-edit"
-                    onCommit={(v) => commitRenameFile(f, v)}
-                    onCancel={() => setEditingFile(null)}
-                  />
-                ) : (
-                  <span
-                    className="file-name"
-                    title={f + "（双击可重命名）" + (isImageFile(f) ? " · 课堂笔记照片，将由图片识别模型转录" : "")}
-                    onDoubleClick={() => setEditingFile(f)}
-                  >
-                    {isImageFile(f) && <span className="file-kind" title="图片素材">📷</span>}
-                    {f}
-                  </span>
-                )}
-                {editingFile !== f && (
-                  <div className="file-actions">
-                    <button className="file-act" onClick={() => setEditingFile(f)} title="重命名">改名</button>
-                    <button className="file-act danger" onClick={() => onDeleteFile(f)} title="删除">删除</button>
+            session.inputs.map((f) => {
+              const img = isImageFile(f);
+              const note = notes[f];
+              const noteOpen = openNote === f;
+              return (
+                <div className="file-item" key={f}>
+                  <div className="file-row">
+                    {editingFile === f ? (
+                      <InlineEdit
+                        initial={f.lastIndexOf(".") > 0 ? f.slice(0, f.lastIndexOf(".")) : f}
+                        className="file-name-edit"
+                        onCommit={(v) => commitRenameFile(f, v)}
+                        onCancel={() => setEditingFile(null)}
+                      />
+                    ) : (
+                      <span
+                        className="file-name"
+                        title={f + "（双击可重命名）" + (img ? " · 课堂笔记照片，将由图片识别模型转录" : "")}
+                        onDoubleClick={() => setEditingFile(f)}
+                      >
+                        {img && <span className="file-kind" title="图片素材">📷</span>}
+                        {f}
+                      </span>
+                    )}
+                    {editingFile !== f && img && noteChip(note?.status)}
+                    {editingFile !== f && (
+                      <div className="file-actions">
+                        {img && (
+                          <button
+                            className={"file-act" + (noteOpen ? " active" : "")}
+                            onClick={() => toggleNote(f)}
+                            title="查看/校对识别文本"
+                          >
+                            笔记
+                          </button>
+                        )}
+                        <button className="file-act" onClick={() => setEditingFile(f)} title="重命名">改名</button>
+                        <button className="file-act danger" onClick={() => onDeleteFile(f)} title="删除">删除</button>
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            ))
+
+                  {img && noteOpen && (
+                    <div className="note-panel">
+                      <p className="muted small note-panel-tip">
+                        识别文本会作为「课堂笔记补充素材」注入撷要/笺注；改完记得点保存校对。
+                      </p>
+                      {noteErr && <div className="banner error">{noteErr}</div>}
+                      {noteMachineText != null && (
+                        <div className="banner note-machine-hint">
+                          已重新识别，当前仍以你的校对为准。
+                          <button
+                            className="link small"
+                            onClick={() => {
+                              setNoteText(noteMachineText);
+                              setNoteMachineText(null);
+                            }}
+                          >
+                            用机器结果覆盖
+                          </button>
+                        </div>
+                      )}
+                      <textarea
+                        className="note-textarea"
+                        rows={5}
+                        value={noteText}
+                        onChange={(e) => setNoteText(e.target.value)}
+                        placeholder="识别文本为空。可点「重新识别」，或手动输入后保存校对。"
+                        disabled={noteBusy}
+                      />
+                      <div className="note-actions">
+                        <button
+                          className="primary"
+                          onClick={() => commitNote(f, noteText)}
+                          disabled={noteBusy || !noteText.trim()}
+                        >
+                          保存校对
+                        </button>
+                        <button
+                          className="ghost-btn"
+                          onClick={() => commitNote(f, "")}
+                          disabled={noteBusy}
+                          title="删除校对，恢复机器识别结果"
+                        >
+                          恢复自动
+                        </button>
+                        <span style={{ flex: 1 }} />
+                        <button
+                          className="ghost-btn"
+                          onClick={() => reTranscribe(f)}
+                          disabled={noteBusy}
+                        >
+                          {noteBusy ? "识别中…" : "重新识别"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })
           ) : (
             <span className="muted small">尚未上传素材。</span>
           )}
@@ -437,6 +616,21 @@ export default function Workbench({ module, sessionId, onBack, providersVersion 
           onChange={(e) => setPrePrompt(e.target.value)}
           placeholder="如：老师叫张三；公司案例是宁德时代；重点体现 DCF 与可比公司法的对比；术语 WACC 必须保留英文。"
         />
+
+        {/* 本项目画像（可选）：覆盖全局画像，仅对本项目生效 */}
+        <div className="persona-section">
+          <div className="persona-section-title">本项目画像（可选）</div>
+          <p className="muted small">
+            用于个性化「对你的启发」等内容。留空则继承全局画像 / 系统默认。
+          </p>
+          <textarea
+            rows={3}
+            value={persona}
+            onChange={(e) => setPersona(e.target.value)}
+            placeholder={personaPlaceholder}
+          />
+        </div>
+
         <div className="row-actions">
           <button className="primary ghost" onClick={savePrePrompt}>保存背景</button>
           {savedHint && <span className="muted small saved">{savedHint}</span>}

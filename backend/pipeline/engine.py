@@ -15,7 +15,7 @@ import queue
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterator, List, Optional
 
 from config import settings
@@ -24,11 +24,13 @@ from modules.base import StepDef
 from modules.business_school import prompts
 from providers import Message, ProviderError, build_provider, get_provider
 from providers import store as provider_store
+from storage import persona as persona_store
 from storage import session_store
 
-from . import vision
+from . import deepnotes, graphcheck, vision
 from .transcript import (
     clean_fallback,
+    first_timestamp_seconds,
     has_timestamps,
     split_by_length,
     strip_timestamps,
@@ -75,10 +77,21 @@ CHAPTERS_MIN_STAGES = 4
 CHAPTERS_MAX_STAGES = 50
 CHAPTERS_MINUTES_PER_STAGE = 6
 CHAPTERS_CHARS_PER_STAGE = 1800
-GRAPH_MAX_TOKENS = 2500
-# 撷要/笺注：整篇一次成稿（依赖现代模型长上下文，不再 map-reduce）
-MINUTES_CONCISE_MAX_TOKENS = 4096
-MINUTES_DETAILED_MAX_TOKENS = 8000
+# 注意：新一代「思考型」模型的隐藏思考 token 也计入 max_tokens，小额上限会在
+# 正文写完前被掐断（真实发生过：导读 800 被截）。以下小额常量均预留思考余量；
+# 实际正文长度仍由提示词约束。
+GRAPH_MAX_TOKENS = 8000
+# 撷要：整篇一次成稿（依赖现代模型长上下文，不再 map-reduce）
+MINUTES_CONCISE_MAX_TOKENS = 8000
+# 笺注：按纲目分单元生成，单元/导读各有独立上限；整篇长度可观。
+# 单元输出上限：反膨胀规则要求「该时段所有具体案例/数据/论断收录或显式舍弃」+ 原话摘引，
+# 信息密集单元的产出可逼近切片本身体量（~12K 字）；思考型模型的隐藏思考也计入
+# max_tokens。10000 在真实课堂上仍被截断过，16000 起才有余量。
+DEEPNOTES_UNIT_MAX_TOKENS = 16000
+DEEPNOTES_INTRO_MAX_TOKENS = 4000
+# 笺注整篇修订上限：修订须一次吐出整篇长笺注，故给到 16000；
+# 若模型输出上限不足触达截断，v0.7 的截断检测会显式报错（属预期行为，提示换大输出上限模型）。
+MINUTES_DETAILED_MAX_TOKENS = 16000
 
 # 每步生成时用的输出上限：修订须复用同一档，否则写死的小上限会把实录/笺注截断。
 STEP_MAX_TOKENS = {
@@ -253,14 +266,16 @@ def _streamed_call(provider, model, system: str, user: str, *, step: str, base: 
     return result.get("text", "")
 
 
-def _correct_chunk(provider, model, sys_p: str, chunk: str, *, tries: int = CORRECT_RETRIES):
+def _correct_chunk(provider, model, sys_p: str, chunk: str, *,
+                   prev_tail: Optional[str] = None, tries: int = CORRECT_RETRIES):
     """纠错单块，带重试。返回 (文本, 是否降级)。
 
     送模型前先确定性去时间戳（保留说话人标签作弱提示）。模型多次返回空或报错时，
     用 clean_fallback 兜底（去标签+时间戳的纯正文），保证实录里【绝不残留】原始标记。
+    prev_tail：前一原始块（去时间戳后）的结尾，仅作说话人衔接/语境提示，不会被输出。
     """
     cleaned = strip_timestamps(chunk)
-    user = prompts.transcript_user(cleaned)
+    user = prompts.transcript_user(cleaned, prev_tail)
     for attempt in range(tries):
         try:
             txt = _call(provider, model, sys_p, user, temperature=0.2, max_tokens=CORRECT_MAX_TOKENS)
@@ -489,7 +504,7 @@ def run_one_step(session_id: str, step_key: str) -> Iterator[dict]:
         elif step_key == "minutes_concise":
             yield from _step_minutes(session_id, meta, pre, "concise", OUT_MINUTES_CONCISE)
         elif step_key == "minutes_detailed":
-            yield from _step_minutes(session_id, meta, pre, "detailed", OUT_MINUTES_DETAILED)
+            yield from _step_minutes_detailed(session_id, meta, pre)
         elif step_key == "graph":
             yield from _step_graph(session_id, meta, pre)
 
@@ -539,7 +554,10 @@ def revise_one_step(session_id: str, step_key: str, instruction: str) -> Iterato
     yield _evt("step", step=step_key, percent=20, message="按修订意见再生成…")
 
     try:
-        sys_p = prompts.revise_system(step_def.title, meta.pre_prompt or "", is_graph=is_graph)
+        # 修订也注入生效画像：撷要/笺注的「对你的启发」应随画像个性化（脉络/图无此节但注入无害）。
+        ptext = persona_store.effective(meta)["text"]
+        sys_p = prompts.revise_system(step_def.title, meta.pre_prompt or "", is_graph=is_graph,
+                                      persona=ptext)
         user_p = prompts.revise_user(current, instruction)
         # 修订必须复用该步骤生成时的输出上限：写死 4096 会把实录/笺注等长产出截断成坏版本。
         revise_max_tokens = STEP_MAX_TOKENS.get(step_key, MINUTES_CONCISE_MAX_TOKENS)
@@ -549,6 +567,14 @@ def revise_one_step(session_id: str, step_key: str, instruction: str) -> Iterato
         )
         if is_graph:
             revised = _extract_required_mermaid(revised)
+            # 修订后的脉络同样在写盘前把关连通性：失败报错不写坏图。
+            conn = graphcheck.connectivity(revised)
+            if not conn["ok"]:
+                raise ProviderError(
+                    "修订后的脉络连通性校验未通过：存在孤立节点/分支"
+                    + (f"（{', '.join(conn['isolated_nodes'][:12])}）" if conn["isolated_nodes"] else "")
+                    + "。请调整修订意见或重试。"
+                )
         version = session_store.write_artifact(session_id, out_name, revised, note=f"修订：{instruction}")
         yield _evt("artifact", step=step_key, name=out_name)
         yield _evt("step", step=step_key, percent=100, message=f"修订完成（v{version}）")
@@ -571,13 +597,26 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
     yield _evt("step", step="transcript", percent=2,
                message=f"拆为 {total} 块，并行纠错中…")
 
+    # 时间锚点：仅当原始稿本身带时间戳才算，取每块首个时间戳的秒数；否则全 None（老会话无锚点）。
+    has_ts = has_timestamps(raw)
+    anchors: List[Optional[int]] = [
+        (first_timestamp_seconds(c) if has_ts else None) for c in chunks
+    ]
+    # 上文回顾：块 i 的 prev_tail 取【前一原始块】去时间戳后的结尾 ~400 字。
+    # 必须来自原始块而非纠错结果——各块并行执行、纠错结果在调度时尚不存在，
+    # 且原始块结尾更稳定；prev_tail 只用于判断说话人衔接，不进入产出。
+    prev_tails: List[Optional[str]] = [None] * total
+    for i in range(1, total):
+        prev_clean = strip_timestamps(chunks[i - 1]).strip()
+        prev_tails[i] = prev_clean[-400:] if prev_clean else None
+
     prov, model = _resolve_provider(meta, "transcript")
     sys_p = prompts.transcript_system(pre)
     results: List[Optional[str]] = [None] * total
     degraded: List[bool] = [False] * total
 
     def _do(i: int):
-        txt, deg = _correct_chunk(prov, model, sys_p, chunks[i])
+        txt, deg = _correct_chunk(prov, model, sys_p, chunks[i], prev_tail=prev_tails[i])
         return i, txt, deg
 
     done = 0
@@ -592,7 +631,7 @@ def _step_transcript(sid: str, meta, pre: str) -> Iterator[dict]:
                        percent=2 + int(95 * done / max(total, 1)),
                        message=f"纠错 {done}/{total}")
 
-    transcript_md = _assemble_transcript(results)
+    transcript_md = _assemble_transcript(results, anchors)
     session_store.write_artifact(sid, OUT_TRANSCRIPT, transcript_md, note="生成")
     yield _evt("artifact", step="transcript", name=OUT_TRANSCRIPT)
     n_deg = sum(degraded)
@@ -644,11 +683,181 @@ def _step_minutes(sid: str, meta, pre: str, detail_level: str, out_name: str) ->
 
     yield _evt("step", step=step_key, percent=15, message=f"综合知识、生成{label}版纪要…")
     prov, model = _resolve_provider(meta, step_key)
+    # 生效画像（项目级>全局>系统默认）：只在纪要步骤注入，用于个性化「对你的启发」。
+    ptext = persona_store.effective(meta)["text"]
     minutes_md = yield from _make_minutes(prov, model, pre, detail_level, step_key,
-                                          transcript_md, chapters_md or "", notes_md)
+                                          transcript_md, chapters_md or "", notes_md, ptext)
     session_store.write_artifact(sid, out_name, minutes_md, note="生成")
     yield _evt("artifact", step=step_key, name=out_name)
     yield _evt("step", step=step_key, percent=100, message=f"{label}版纪要完成")
+
+
+def _gen_deepnotes_unit(prov, model, sys_p: str, unit: dict, unit_index: int, unit_count: int,
+                        outline_titles: str) -> dict:
+    """生成单个笺注单元并过覆盖率闸门，返回 {阶段号: 该阶段节正文(不含标题行)}。
+
+    覆盖率闸门：本单元每个阶段号必须在输出里找到对应 `### 阶段N` 节；缺失则带反馈重试一次，
+    仍缺 → ProviderError（由上层捕获 → 不落盘）。非流式调用，temperature 0.3。
+    """
+    stage_nums = [s["num"] for s in unit["stages"]]
+    unit_stages_md = "\n\n".join(
+        (s["heading"] + ("\n" + s["body"] if s.get("body") else "")) for s in unit["stages"]
+    )
+    user_p = prompts.deepnotes_unit_user(
+        unit_stages_md, unit["slice"], outline_titles, unit_index, unit_count
+    )
+    # 首次调用对瞬时故障（中转站连接抖动/限流）多给一次机会；
+    # 截断类错误直接上抛——同参数重试必然再截断，白白翻倍成本。
+    try:
+        txt = _call(prov, model, sys_p, user_p, temperature=0.3, max_tokens=DEEPNOTES_UNIT_MAX_TOKENS)
+    except ProviderError as e:
+        if "截断" in str(e):
+            raise
+        time.sleep(1.0)
+        txt = _call(prov, model, sys_p, user_p, temperature=0.3, max_tokens=DEEPNOTES_UNIT_MAX_TOKENS)
+    sections = deepnotes.split_stage_sections(txt)
+    missing = [n for n in stage_nums if n not in sections]
+    if missing:
+        # 带反馈重试一次：明确指出缺哪些阶段、标题行须原样。
+        feedback = user_p + (
+            f"\n\n【上次输出缺少阶段 {('、'.join(str(n) for n in missing))}，"
+            "必须包含这些阶段，且每个阶段的标题行（`### 阶段N：…`）原样复用纲目，不得遗漏。】"
+        )
+        txt = _call(prov, model, sys_p, feedback, temperature=0.3,
+                    max_tokens=DEEPNOTES_UNIT_MAX_TOKENS)
+        sections = deepnotes.split_stage_sections(txt)
+        missing = [n for n in stage_nums if n not in sections]
+        if missing:
+            raise ProviderError(
+                f"笺注单元生成缺少阶段 {('、'.join(str(n) for n in missing))}，"
+                "重试后仍未补齐。请重试或切换更强的模型。"
+            )
+    return {n: sections[n] for n in stage_nums}
+
+
+# 导读「反问式跑偏」的特征词：中转站偶发丢失 system prompt 时，模型会把纲目当成
+# 无指令输入而反问。出现这些特征即判为不合格。
+_INTRO_BAD_SIGNS = ("需要我", "您希望", "你希望", "告诉我", "请问", "什么需求", "帮您")
+
+
+def _intro_acceptable(text: str) -> bool:
+    """导读合理性校验：非空、不超长（300 字要求，容忍到 600）、且不是反问式跑偏。"""
+    t = (text or "").strip()
+    if not t or len(t) > 600:
+        return False
+    return not any(sign in t for sign in _INTRO_BAD_SIGNS)
+
+
+def _gen_deepnotes_intro(prov, model, persona_text: str, pre: str, chapters_md: str) -> str:
+    """生成导读，带一次重试；两次都不合格返回 ""（拼装容忍无导读，绝不放坏内容进产出）。"""
+    for _ in range(2):
+        try:
+            intro = _call(prov, model, prompts.deepnotes_intro_system(persona_text, pre),
+                          prompts.deepnotes_intro_user(chapters_md),
+                          temperature=0.3, max_tokens=DEEPNOTES_INTRO_MAX_TOKENS)
+        except ProviderError:
+            intro = ""
+        if _intro_acceptable(intro):
+            return intro.strip()
+    return ""
+
+
+def _assemble_deepnotes(title: str, intro: str, items: List[dict], sections: dict,
+                        notes_md: str) -> str:
+    """确定性拼装笺注：标题 + 【导读】引用块 + 按纲目原顺序回放（part 标题原样、
+    stage 用生成节，节序=纲目序、按阶段号取）+ 可选笔记照片附录。"""
+    out: List[str] = [f"# 笺注：{title}".rstrip(), ""]
+    intro = (intro or "").strip()
+    if intro:
+        out.append("> **【导读】**")
+        out.append(">")
+        for ln in intro.splitlines():
+            out.append(f"> {ln}" if ln.strip() else ">")
+        out.append("")
+    for it in items:
+        if it.get("kind") == "part":
+            out.append(it["heading"].strip())
+            out.append("")
+        elif it.get("kind") == "stage":
+            out.append(it["heading"].strip())
+            out.append("")
+            body = (sections.get(it["num"]) or "").strip()
+            if body:
+                out.append(body)
+                out.append("")
+    notes_md = (notes_md or "").strip()
+    if notes_md:
+        out.append("## 附录：课堂笔记照片转录")
+        out.append("")
+        out.append(notes_md)
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _step_minutes_detailed(sid: str, meta, pre: str) -> Iterator[dict]:
+    """笺注：按纲目逐阶段深度展开。依赖 实录 + 纲目（已由依赖检查保证存在）。
+
+    流程：解析纲目/锚点 → 打包单元 → 并行生成各单元（带覆盖率闸门）→ 生成导读 →
+    确定性拼装（part 原位回插、阶段按纲目序回放）→ 附录回填笔记照片转录 → 写盘。
+    """
+    step_key = "minutes_detailed"
+    transcript_md = _read_artifact_or_legacy(sid, OUT_TRANSCRIPT) or ""
+    chapters_md = _read_artifact_or_legacy(sid, OUT_CHAPTERS) or ""
+
+    # 笔记照片（辅助素材）：沿用与撷要一致的链路与进度事件。
+    notes_md = ""
+    n_images = len(session_store.list_image_inputs(sid))
+    if n_images:
+        yield _evt("step", step=step_key, percent=6, message=f"识别 {n_images} 张笔记照片…")
+        notes_md, ninfo = vision.collect_note_text(sid, pre)
+        for evt in _note_progress_events(step_key, ninfo):
+            yield evt
+
+    items = deepnotes.parse_outline(chapters_md)
+    if not any(it.get("kind") == "stage" for it in items):
+        # 纲目里解析不到任何阶段（残缺/格式异常）：没有骨架就没有笺注，
+        # 静默生成「只有标题和导读」的空壳比报错危害更大。
+        raise ProviderError("纲目中解析不到任何阶段标题，无法编纂笺注。请先重新生成「纲目」。")
+    anchors = deepnotes.parse_anchors(transcript_md)
+    units = deepnotes.group_units(items, transcript_md, anchors)
+    outline_titles = _outline_titles(chapters_md)
+
+    prov, model = _resolve_provider(meta, step_key)
+    ptext = persona_store.effective(meta)["text"]
+    sys_p = prompts.deepnotes_unit_system(ptext, pre)
+
+    yield _evt("step", step=step_key, percent=15,
+               message=f"按纲目分 {len(units)} 个单元并行编纂笺注…")
+
+    sections: dict = {}
+    unit_count = len(units)
+    if unit_count:
+        done = 0
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+            futs = {
+                ex.submit(_gen_deepnotes_unit, prov, model, sys_p, unit, idx + 1, unit_count,
+                          outline_titles): idx
+                for idx, unit in enumerate(units)
+            }
+            for fut in as_completed(futs):
+                part = fut.result()  # 覆盖率不达 → ProviderError 冒泡（上层不落盘）
+                sections.update(part)
+                done += 1
+                yield _evt("step", step=step_key,
+                           percent=min(85, 15 + int(70 * done / unit_count)),
+                           message=f"笺注单元 {done}/{unit_count}")
+
+    # 导读：全课主线（非流式，短上限）。
+    yield _evt("step", step=step_key, percent=88, message="撰写导读…")
+    intro = _gen_deepnotes_intro(prov, model, ptext, pre, chapters_md)
+    if not intro:
+        yield _evt("step", step=step_key, percent=90,
+                   message="导读生成两次均不合格，本次省略导读（不影响正文）。")
+
+    minutes_md = _assemble_deepnotes(meta.title, intro, items, sections, notes_md)
+    session_store.write_artifact(sid, OUT_MINUTES_DETAILED, minutes_md, note="生成")
+    yield _evt("artifact", step=step_key, name=OUT_MINUTES_DETAILED)
+    yield _evt("step", step=step_key, percent=100, message="详尽版纪要完成")
 
 
 def _note_progress_events(step_key: str, ninfo: dict) -> List[dict]:
@@ -672,7 +881,26 @@ def _note_progress_events(step_key: str, ninfo: dict) -> List[dict]:
         prov = f"（{ninfo.get('provider')}）" if ninfo.get("provider") else ""
         evts.append(_evt("step", step=step_key, percent=12,
                          message="笔记照片：" + "、".join(parts) + prov))
+    # 逐张列出失败原因（文件名：原因），并提示可在素材区单张重试/校对——
+    # 只报「N 张失败」用户无从判断是限流还是图糊。单条截断、控制总长度。
+    failures = ninfo.get("failures") or {}
+    if failures:
+        lines = [f"「{fn}」：{(reason or '识别失败')[:60]}" for fn, reason in failures.items()]
+        detail = "；".join(lines)
+        if len(detail) > 600:
+            detail = detail[:600] + "…"
+        evts.append(_evt("step", step=step_key, percent=13,
+                         message="以下笔记照片识别失败，可在素材区对该图单张重新识别或手动校对：\n"
+                                 + detail))
     return evts
+
+
+def _outline_titles(chapters_md: str) -> str:
+    """抽取纲目里的部分/阶段标题行（授课顺序参考），供脉络分支左右排序。"""
+    lines = []
+    for it in deepnotes.parse_outline(chapters_md or ""):
+        lines.append(it["heading"].strip())
+    return "\n".join(lines)
 
 
 def _step_graph(sid: str, meta, pre: str) -> Iterator[dict]:
@@ -681,22 +909,75 @@ def _step_graph(sid: str, meta, pre: str) -> Iterator[dict]:
         _read_artifact_or_legacy(sid, OUT_MINUTES_DETAILED)
         or _read_artifact_or_legacy(sid, OUT_MINUTES_CONCISE)
     )
+    chapters_md = _read_artifact_or_legacy(sid, OUT_CHAPTERS) or ""  # 可无
+    outline = _outline_titles(chapters_md)
     yield _evt("step", step="graph", percent=15, message="绘制知识脉络…")
     prov, model = _resolve_provider(meta, "graph")
-    raw_graph = _call(prov, model, prompts.graph_system(pre), prompts.graph_user(minutes_md),
+    sys_p = prompts.graph_system(pre)
+
+    raw_graph = _call(prov, model, sys_p, prompts.graph_user(minutes_md, outline or None),
                       temperature=0.3, max_tokens=GRAPH_MAX_TOKENS)
     graph_code = _extract_required_mermaid(raw_graph)
+
+    # 连通性校验：不通过则带反馈重试一次；仍不通过 → 报错不落盘（绝不写坏图）。
+    conn = graphcheck.connectivity(graph_code)
+    if not conn["ok"]:
+        yield _evt("step", step="graph", percent=55, message="检测到孤立节点/分支，补连通性重试…")
+        user_retry = prompts.graph_user(minutes_md, outline or None) + _graph_conn_feedback(conn)
+        raw_graph = _call(prov, model, sys_p, user_retry, temperature=0.2, max_tokens=GRAPH_MAX_TOKENS)
+        graph_code = _extract_required_mermaid(raw_graph)
+        conn = graphcheck.connectivity(graph_code)
+        if not conn["ok"]:
+            raise ProviderError(
+                "脉络连通性校验未通过：仍存在孤立节点/分支"
+                + (f"（{', '.join(conn['isolated_nodes'][:12])}）" if conn["isolated_nodes"] else "")
+                + "。请重试或切换更强的模型。"
+            )
+
     session_store.write_artifact(sid, OUT_GRAPH, graph_code, note="生成")
     yield _evt("artifact", step="graph", name=OUT_GRAPH)
     yield _evt("step", step="graph", percent=100, message="脉络完成")
 
 
+def _graph_conn_feedback(conn: dict) -> str:
+    """把连通性检查结果拼成给模型的返修反馈。"""
+    iso = conn.get("isolated_nodes") or []
+    listed = ("：" + "、".join(iso[:20])) if iso else ""
+    return (
+        "\n\n【上次生成的流程图不连通，存在孤立节点/分支"
+        f"{listed}。这些节点/分支必须补上带标注的关系连线（如 -->|递进| / -->|因果| / -->|展开|），"
+        "使【全图连通、无任何孤立节点】。请重新输出完整 Mermaid 代码。】"
+    )
+
+
 # ---------- 工具 ----------
-def _assemble_transcript(results) -> str:
+def _fmt_anchor(sec: int) -> str:
+    """把秒数格式化为锚点小标题时间：有小时 H:MM:SS，无小时 MM:SS。"""
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _assemble_transcript(results, anchors=None) -> str:
     """拼接各块结果为连续正文（块内由模型语义重组发言人、块间空行衔接）。
-    results 已是纠错文本或确定性兜底文本，绝不回退到带标签/时间戳的原文。"""
-    paras = [(r or "").strip() for r in results]
-    body = "\n\n".join(p for p in paras if p).strip()
+    results 已是纠错文本或确定性兜底文本，绝不回退到带标签/时间戳的原文。
+
+    anchors：与 results 等长的锚点秒数列表（None=该块无锚点）。有锚点的块前插
+    `#### ⏱ H:MM:SS` 小标题，供下游笺注按时段切片；无锚点（老会话/无时间戳）不插。
+    """
+    if anchors is None:
+        anchors = [None] * len(results)
+    blocks: List[str] = []
+    for i, r in enumerate(results):
+        para = (r or "").strip()
+        if not para:
+            continue
+        anchor = anchors[i] if i < len(anchors) else None
+        if anchor is not None:
+            blocks.append(f"#### ⏱ {_fmt_anchor(anchor)}\n\n{para}")
+        else:
+            blocks.append(para)
+    body = "\n\n".join(blocks).strip()
     return f"# 实录\n\n{body}\n"
 
 
@@ -779,12 +1060,13 @@ def _make_chapters(provider, model, pre: str, transcript_md: str, raw_text: str,
 
 
 def _make_minutes(provider, model, pre: str, detail_level: str, step_key: str, transcript_md: str,
-                  chapters_md: str, notes_md: str = ""):
+                  chapters_md: str, notes_md: str = "", persona: str = ""):
     """生成器：整篇一次成稿（依赖现代模型长上下文），边生成边 yield 瞬态进度、return 文本。
 
     把完整实录(+纲目+笔记照片转录)一次喂给模型，避免 map-reduce 丢上下文/丢跨段关联。
-    超出所选模型上下文时由 provider 直接报错，用户改用大上下文模型即可（不再静默降级）。"""
-    system = prompts.minutes_system(pre, detail_level)
+    超出所选模型上下文时由 provider 直接报错，用户改用大上下文模型即可（不再静默降级）。
+    persona：学员画像，注入纪要用于个性化「对你的启发」（空=系统默认，见 prompts._persona）。"""
+    system = prompts.minutes_system(pre, detail_level, persona)
     max_tokens = MINUTES_DETAILED_MAX_TOKENS if detail_level == "detailed" else MINUTES_CONCISE_MAX_TOKENS
     return (yield from _streamed_call(
         provider, model, system,

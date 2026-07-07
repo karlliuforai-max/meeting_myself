@@ -243,3 +243,53 @@ class ApiKeyMaskingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------- temperature 被模型拒绝时自动去参重试（v0.8.0）----------
+class _TempRejectingClient:
+    """假 OpenAI client：带 temperature 的请求 400，去掉后成功。"""
+
+    def __init__(self):
+        self.calls = []
+
+        class _Completions:
+            def __init__(self, outer):
+                self.outer = outer
+
+            def create(self, **kwargs):
+                self.outer.calls.append(dict(kwargs))
+                if "temperature" in kwargs:
+                    raise RuntimeError("400 - `temperature` is deprecated for this model.")
+                from types import SimpleNamespace
+                choice = SimpleNamespace(
+                    message=SimpleNamespace(content="ok"), finish_reason="stop")
+                return SimpleNamespace(choices=[choice], usage=None)
+
+        class _Chat:
+            def __init__(self, outer):
+                self.completions = _Completions(outer)
+
+        self.chat = _Chat(self)
+
+
+def test_openai_temperature_rejection_retries_without_param():
+    from providers.dynamic import DynamicOpenAIProvider
+    from providers.base import Message
+
+    p = DynamicOpenAIProvider({
+        "id": "t", "label": "t", "kind": "openai",
+        "base_url": "http://x", "api_key": "k",
+        "models": ["m"], "default_model": "m", "supports_vision": False,
+    })
+    fake = _TempRejectingClient()
+    p._client_cache = fake
+
+    res = p.chat([Message("user", "hi")], model="m", temperature=0.3, max_tokens=16)
+    assert res.text == "ok"
+    # 第一次带 temperature 被拒，第二次去参成功
+    assert "temperature" in fake.calls[0] and "temperature" not in fake.calls[1]
+
+    # 实例已记住：后续调用直接不带 temperature（只多一次调用）
+    n = len(fake.calls)
+    p.chat([Message("user", "hi2")], model="m", temperature=0.3, max_tokens=16)
+    assert len(fake.calls) == n + 1 and "temperature" not in fake.calls[-1]

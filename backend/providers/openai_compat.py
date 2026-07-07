@@ -81,15 +81,23 @@ class _OpenAICompatBase(BaseProvider):
                 return streamed
             # 首个 delta 之前就失败（部分中转站不支持 stream）→ 降级非流式重试一次。
 
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=payload,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        except Exception as e:  # noqa: BLE001
-            raise ProviderError(f"{self.name} 调用失败：{e}") from e
+        # 部分新模型/中转站拒绝 temperature 参数（"deprecated/unsupported"）：
+        # 首次被拒时去掉该参数重试一次，并记在实例上（同一实例后续调用不再发送）。
+        resp = None
+        send_temp = not getattr(self, "_no_temperature", False)
+        for attempt in (0, 1):
+            kwargs = dict(model=model, messages=payload, max_tokens=max_tokens)
+            if send_temp:
+                kwargs["temperature"] = temperature
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 0 and send_temp and _temperature_rejected(e):
+                    self._no_temperature = True
+                    send_temp = False
+                    continue
+                raise ProviderError(f"{self.name} 调用失败：{e}") from e
 
         text = resp.choices[0].message.content or ""
         finish = _normalize_finish(getattr(resp.choices[0], "finish_reason", None))
@@ -103,14 +111,13 @@ class _OpenAICompatBase(BaseProvider):
         usage: dict = {}
         got_first = False
         try:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=payload,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-                stream_options={"include_usage": True},
+            kwargs = dict(
+                model=model, messages=payload, max_tokens=max_tokens,
+                stream=True, stream_options={"include_usage": True},
             )
+            if not getattr(self, "_no_temperature", False):
+                kwargs["temperature"] = temperature
+            stream = client.chat.completions.create(**kwargs)
             for event in stream:
                 if getattr(event, "usage", None):
                     usage = _usage_of(event.usage)
@@ -127,11 +134,25 @@ class _OpenAICompatBase(BaseProvider):
         except Exception as e:  # noqa: BLE001
             if got_first:  # 已经流出内容 → 真错误，不再降级
                 raise ProviderError(f"{self.name} 调用失败：{e}") from e
+            if _temperature_rejected(e):
+                # 记住拒绝原因，让紧随其后的非流式降级重试直接不带 temperature。
+                self._no_temperature = True
             return None
         return ChatResult(
             text="".join(chunks), model=model, provider=self.name,
             usage=usage, finish_reason=finish or "stop",
         )
+
+
+def _temperature_rejected(err: Exception) -> bool:
+    """判断报错是否为「该模型不接受 temperature 参数」。
+
+    新一代模型（及部分中转站映射）会对 temperature 返回 400 deprecated/unsupported；
+    这类错误应自动去参重试，而不是让整次生成失败。"""
+    s = str(err).lower()
+    return "temperature" in s and any(
+        k in s for k in ("deprecated", "unsupported", "not supported", "不支持")
+    )
 
 
 def _normalize_finish(reason: Optional[str]) -> str:

@@ -150,6 +150,32 @@ def has_timestamps(text: str) -> bool:
     return False
 
 
+def first_timestamp_seconds(text: str) -> Optional[int]:
+    """返回文本中第一个可识别时间戳的秒数；没有任何时间戳时返回 None。
+
+    复用 _match_speaker/_TS/_SRT 的识别逻辑，逐行扫描直到命中第一个时间戳。
+    用于给实录各分块打「时间锚点」——分块首行对应的授课时刻。
+    """
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _SRT.match(line):
+            # SRT 行首即时间轴，取起始时间（第一个内联时间戳）。
+            m = _TS_INNER.search(line)
+            if m:
+                return _to_seconds(m.group(1), m.group(2), m.group(3))
+            continue
+        sp, speaker_sec, speaker_body = _match_speaker(line)
+        if speaker_sec is not None:
+            return speaker_sec
+        body = speaker_body if sp is not None else line
+        m = _TS.match(body)
+        if m and (m.group(1) or m.group(2)):
+            return _to_seconds(m.group(1), m.group(2), m.group(3))
+    return None
+
+
 def transcript_duration_seconds(text: str) -> Optional[int]:
     """根据原稿里的首末时间戳估算课堂时长；不足两个时间点时返回 None。"""
     seconds: List[int] = []

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { api } from "./api";
 import ModuleSidebar from "./components/ModuleSidebar.jsx";
 import ModelConfig from "./components/ModelConfig.jsx";
+import PersonaModal from "./components/PersonaModal.jsx";
 import ModuleHome from "./pages/ModuleHome.jsx";
 import Workbench from "./pages/Workbench.jsx";
 
@@ -12,6 +13,8 @@ export default function App() {
   const [activeSession, setActiveSession] = useState(null);
   const [error, setError] = useState("");
   const [showConfig, setShowConfig] = useState(false);
+  const [showPersona, setShowPersona] = useState(false);
+  const [personaVersion, setPersonaVersion] = useState(0); // 全局画像变更后自增，触发工作台刷新 effective_persona
   const [providersVersion, setProvidersVersion] = useState(0); // 配置变更后自增，触发工作台重载 provider
 
   useEffect(() => {
@@ -43,6 +46,10 @@ export default function App() {
               ? `后端在线${health.version ? " · v" + health.version : ""} · ${health.phase}`
               : "后端离线"}
           </div>
+          <button className="config-btn" onClick={() => setShowPersona(true)} title="个人画像">
+            <span className="config-ico">👤</span>
+            <span>个人画像</span>
+          </button>
           <button className="config-btn" onClick={() => setShowConfig(true)} title="模型配置">
             <span className="config-ico">⚙</span>
             <span>模型配置</span>
@@ -54,6 +61,13 @@ export default function App() {
         <ModelConfig
           onClose={() => setShowConfig(false)}
           onChanged={() => setProvidersVersion((v) => v + 1)}
+        />
+      )}
+
+      {showPersona && (
+        <PersonaModal
+          onClose={() => setShowPersona(false)}
+          onChanged={() => setPersonaVersion((v) => v + 1)}
         />
       )}
 
@@ -77,6 +91,7 @@ export default function App() {
               sessionId={activeSession}
               onBack={() => setActiveSession(null)}
               providersVersion={providersVersion}
+              personaVersion={personaVersion}
             />
           ) : (
             <ModuleHome module={current} onOpenSession={setActiveSession} />
